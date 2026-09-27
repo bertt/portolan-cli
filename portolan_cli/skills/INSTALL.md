@@ -7,11 +7,19 @@ claude plugin marketplace add portolan-sdi/portolan-skills
 claude plugin install portolan
 ```
 
-Skills become available under the `portolan:` prefix: `portolan:git-backed-catalog`, `portolan:portolan-bootstrap`, `portolan:portolan-cli`, `portolan:portolan-consume`, `portolan:portolan-migrate`, `portolan:portolan-thumbnails`, `portolan:reading-portolan`, `portolan:register-catalog`, `portolan:report-catalog-issue`, and `portolan:sourcecoop`.
+Skills become available under the `portolan:` prefix: `portolan:git-backed-catalog`, `portolan:portolan-bootstrap`, `portolan:portolan-cli`, `portolan:portolan-migrate`, `portolan:portolan-thumbnails`, `portolan:reading-portolan`, `portolan:register-catalog`, `portolan:report-catalog-issue`, and `portolan:sourcecoop`.
 
-### Claude Code (Web / Cowork)
+### Claude.ai (web and desktop apps)
 
-The web app at [claude.ai/code](https://claude.ai/code) does not currently support plugin installation. To use these skills in Cowork, paste the content of a SKILL.md file into your project's `CLAUDE.md` or provide it as context.
+Claude.ai supports plugin marketplaces directly, including in Cowork:
+
+1. Open **Settings → Customize** (or the **Customize** panel in Cowork)
+2. Go to the **Plugins** tab
+3. Select **Add → Add marketplace → Add from a repository**
+4. Enter `portolan-sdi/portolan-skills`
+5. Install the **Portolan** plugin from the marketplace
+
+The skills then become available in your Claude sessions, including Cowork.
 
 ### Gemini CLI
 
@@ -25,8 +33,6 @@ gemini skills install https://github.com/portolan-sdi/portolan-skills.git \
   --path skills/portolan-bootstrap --consent
 gemini skills install https://github.com/portolan-sdi/portolan-skills.git \
   --path skills/portolan-cli --consent
-gemini skills install https://github.com/portolan-sdi/portolan-skills.git \
-  --path skills/portolan-consume --consent
 gemini skills install https://github.com/portolan-sdi/portolan-skills.git \
   --path skills/portolan-migrate --consent
 gemini skills install https://github.com/portolan-sdi/portolan-skills.git \
