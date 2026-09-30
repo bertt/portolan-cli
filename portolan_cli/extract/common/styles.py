@@ -129,6 +129,49 @@ def _redact_url_for_logging(url: str) -> str:
     return urlunparse(parsed._replace(query=""))
 
 
+# Query parameter names (case-insensitive) that commonly carry a credential.
+# A plain-HTTP request exposes any of these to a network observer, since the
+# request has no TLS confidentiality (RFC 9110 section 4.2.2).
+_CREDENTIAL_QUERY_PARAM_NAMES = frozenset(
+    {
+        "apikey",
+        "api_key",
+        "access_token",
+        "token",
+        "auth",
+        "authorization",
+        "key",
+        "secret",
+        "client_secret",
+        "password",
+    }
+)
+
+
+def _reject_credential_bearing_http_url(url: str) -> None:
+    """Refuse to fetch a non-HTTPS URL that carries a credential.
+
+    Args:
+        url: URL that will be sent as-is to the remote service.
+
+    Raises:
+        StyleExtractionError: If the URL uses a non-HTTPS scheme and its
+            query string has a parameter name that looks like a credential.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "https":
+        return
+
+    query_param_names = {name.lower() for name, _ in parse_qsl(parsed.query)}
+    leaked = query_param_names & _CREDENTIAL_QUERY_PARAM_NAMES
+    if leaked:
+        raise StyleExtractionError(
+            f"Refusing to send credential-bearing query parameter(s) "
+            f"{sorted(leaked)} over a non-HTTPS URL "
+            f"({_redact_url_for_logging(url)}). Use an https:// endpoint."
+        )
+
+
 def _build_wms_getstyles_url(wfs_url: str, layer_name: str) -> str:
     """Build WMS GetStyles URL from WFS endpoint.
 
@@ -207,8 +250,11 @@ def _fetch_wms_style(url: str, timeout: float = 30.0) -> str:
         SLD XML string.
 
     Raises:
-        StyleExtractionError: On HTTP or response errors.
+        StyleExtractionError: On HTTP or response errors, or if the URL
+            carries a credential over a non-HTTPS scheme.
     """
+    _reject_credential_bearing_http_url(url)
+
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             response = client.get(url)
@@ -435,9 +481,12 @@ def _fetch_wms_legend(url: str, timeout: float = 30.0) -> bytes | None:
         timeout: Request timeout in seconds.
 
     Returns:
-        PNG image bytes if successful, None on errors.
+        PNG image bytes if successful, None on errors (including a
+        credential-bearing non-HTTPS URL).
     """
     try:
+        _reject_credential_bearing_http_url(url)
+
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             response = client.get(url)
             response.raise_for_status()
@@ -461,6 +510,9 @@ def _fetch_wms_legend(url: str, timeout: float = 30.0) -> bytes | None:
         return None
     except httpx.RequestError as e:
         logger.warning("WMS GetLegendGraphic request failed: %s", e)
+        return None
+    except StyleExtractionError as e:
+        logger.warning("%s", e)
         return None
 
 

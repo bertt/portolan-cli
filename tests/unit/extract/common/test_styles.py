@@ -45,6 +45,44 @@ class TestRedactURLForLogging:
         assert result == "https://example.com/geoserver/wms"
 
 
+class TestRejectCredentialBearingHTTPURL:
+    """Tests for the plain-HTTP credential guard (security review)."""
+
+    def test_rejects_http_url_with_apikey(self) -> None:
+        """A plain-HTTP URL with an apikey is refused."""
+        from portolan_cli.extract.common.styles import (
+            StyleExtractionError,
+            _reject_credential_bearing_http_url,
+        )
+
+        with pytest.raises(StyleExtractionError, match="non-HTTPS"):
+            _reject_credential_bearing_http_url("http://example.com/wms?apikey=SECRET123")
+
+    def test_error_message_does_not_leak_the_key(self) -> None:
+        """The raised error redacts the query string."""
+        from portolan_cli.extract.common.styles import (
+            StyleExtractionError,
+            _reject_credential_bearing_http_url,
+        )
+
+        with pytest.raises(StyleExtractionError) as exc_info:
+            _reject_credential_bearing_http_url("http://example.com/wms?apikey=SECRET123")
+
+        assert "SECRET123" not in str(exc_info.value)
+
+    def test_allows_https_url_with_apikey(self) -> None:
+        """An HTTPS URL with an apikey is allowed."""
+        from portolan_cli.extract.common.styles import _reject_credential_bearing_http_url
+
+        _reject_credential_bearing_http_url("https://example.com/wms?apikey=SECRET123")
+
+    def test_allows_http_url_without_credential_params(self) -> None:
+        """A plain-HTTP URL without a credential-like param is allowed."""
+        from portolan_cli.extract.common.styles import _reject_credential_bearing_http_url
+
+        _reject_credential_bearing_http_url("http://example.com/wms?service=WMS&layers=test")
+
+
 class TestBuildWMSGetStylesURL:
     """Tests for WMS URL construction."""
 
@@ -91,6 +129,24 @@ class TestBuildWMSGetStylesURL:
         assert "request=GetStyles" in result
         assert "GetCapabilities" not in result
         assert "service=WFS" not in result
+
+
+class TestFetchWMSStyle:
+    """Tests for WMS style fetching."""
+
+    def test_raises_for_http_url_with_apikey(self) -> None:
+        """A plain-HTTP URL with an apikey is refused before any request is sent."""
+        from unittest.mock import patch
+
+        from portolan_cli.extract.common.styles import StyleExtractionError, _fetch_wms_style
+
+        with (
+            patch("portolan_cli.extract.common.styles.httpx.Client") as mock_client,
+            pytest.raises(StyleExtractionError, match="non-HTTPS"),
+        ):
+            _fetch_wms_style("http://example.com/wms?apikey=SECRET123")
+
+        mock_client.assert_not_called()
 
 
 class TestExtractWMSStyle:
@@ -427,6 +483,18 @@ class TestBuildWMSGetLegendGraphicURL:
 
 class TestFetchWMSLegend:
     """Tests for WMS legend fetching."""
+
+    def test_returns_none_for_http_url_with_apikey(self) -> None:
+        """A plain-HTTP URL with an apikey is refused before any request is sent."""
+        from unittest.mock import patch
+
+        from portolan_cli.extract.common.styles import _fetch_wms_legend
+
+        with patch("portolan_cli.extract.common.styles.httpx.Client") as mock_client:
+            result = _fetch_wms_legend("http://example.com/wms?apikey=SECRET123")
+
+        assert result is None
+        mock_client.assert_not_called()
 
     def test_returns_bytes_on_success(self) -> None:
         """Returns PNG bytes when request succeeds."""
