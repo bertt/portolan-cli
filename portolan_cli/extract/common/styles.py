@@ -30,7 +30,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -136,7 +136,12 @@ def _build_wms_getstyles_url(wfs_url: str, layer_name: str) -> str:
         "layers": layer_name,
     }
 
-    new_parsed = parsed._replace(path=path, query=urlencode(params))
+    # Merge with the original query string so non-WMS parameters (e.g. an
+    # API key) survive; the new WMS parameters override same-named ones.
+    merged_params = dict(parse_qsl(parsed.query))
+    merged_params.update(params)
+
+    new_parsed = parsed._replace(path=path, query=urlencode(merged_params))
     return urlunparse(new_parsed)
 
 
@@ -165,7 +170,12 @@ def _build_wms_getlegendgraphic_url(wfs_url: str, layer_name: str) -> str:
         "format": "image/png",
     }
 
-    new_parsed = parsed._replace(path=path, query=urlencode(params))
+    # Merge with the original query string so non-WMS parameters (e.g. an
+    # API key) survive; the new WMS parameters override same-named ones.
+    merged_params = dict(parse_qsl(parsed.query))
+    merged_params.update(params)
+
+    new_parsed = parsed._replace(path=path, query=urlencode(merged_params))
     return urlunparse(new_parsed)
 
 

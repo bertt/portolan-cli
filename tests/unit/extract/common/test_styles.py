@@ -53,6 +53,24 @@ class TestBuildWMSGetStylesURL:
         assert "geonode.pergamino.gob.ar" in result
         assert "/geoserver/wms" in result
 
+    def test_preserves_extra_query_params(self) -> None:
+        """Non-WMS query parameters (e.g. an API key) survive (issue #910)."""
+        wfs_url = "https://example.com/geoserver/wfs?apikey=YOUR_API_KEY"
+        result = _build_wms_getstyles_url(wfs_url, "geonode:layer")
+
+        assert "apikey=YOUR_API_KEY" in result
+        assert "request=GetStyles" in result
+
+    def test_new_params_override_same_named_wfs_params(self) -> None:
+        """New WMS parameters override same-named parameters from the WFS URL."""
+        wfs_url = "https://example.com/geoserver/wfs?service=WFS&request=GetCapabilities"
+        result = _build_wms_getstyles_url(wfs_url, "layer")
+
+        assert "service=WMS" in result
+        assert "request=GetStyles" in result
+        assert "GetCapabilities" not in result
+        assert "service=WFS" not in result
+
 
 class TestExtractWMSStyle:
     """Tests for WMS style extraction."""
@@ -353,6 +371,16 @@ class TestBuildWMSGetLegendGraphicURL:
 
         assert "geonode.pergamino.gob.ar" in result
         assert "/geoserver/wms" in result
+
+    def test_preserves_extra_query_params(self) -> None:
+        """Non-WMS query parameters (e.g. an API key) survive (issue #910)."""
+        from portolan_cli.extract.common.styles import _build_wms_getlegendgraphic_url
+
+        wfs_url = "https://example.com/geoserver/wfs?apikey=YOUR_API_KEY"
+        result = _build_wms_getlegendgraphic_url(wfs_url, "geonode:layer")
+
+        assert "apikey=YOUR_API_KEY" in result
+        assert "request=GetLegendGraphic" in result
 
 
 class TestFetchWMSLegend:
