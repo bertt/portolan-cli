@@ -112,6 +112,23 @@ def _wfs_url_to_wms_path(wfs_url: str) -> tuple[str, str]:
     return f"{parsed.scheme}://{parsed.netloc}", path
 
 
+def _redact_url_for_logging(url: str) -> str:
+    """Strip query parameters from a URL before logging it.
+
+    URLs built from a WFS endpoint can carry sensitive values (e.g. an
+    ``apikey``) in the query string. Logging only scheme, host and path
+    keeps debug output useful without leaking credentials.
+
+    Args:
+        url: Full URL, possibly with a query string.
+
+    Returns:
+        URL with the query string removed.
+    """
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(query=""))
+
+
 def _build_wms_getstyles_url(wfs_url: str, layer_name: str) -> str:
     """Build WMS GetStyles URL from WFS endpoint.
 
@@ -312,7 +329,7 @@ def extract_wms_style(
 
     # Build WMS URL
     wms_url = _build_wms_getstyles_url(wfs_url, layer_name)
-    logger.debug("Fetching WMS style from: %s", wms_url)
+    logger.debug("Fetching WMS style from: %s", _redact_url_for_logging(wms_url))
 
     try:
         sld_xml = _fetch_wms_style(wms_url, timeout=timeout)
@@ -496,7 +513,7 @@ def extract_wms_legend(
     """
     # Build WMS GetLegendGraphic URL
     legend_url = _build_wms_getlegendgraphic_url(wfs_url, layer_name)
-    logger.debug("Fetching WMS legend from: %s", legend_url)
+    logger.debug("Fetching WMS legend from: %s", _redact_url_for_logging(legend_url))
 
     # Fetch legend image
     legend_bytes = _fetch_wms_legend(legend_url, timeout=timeout)

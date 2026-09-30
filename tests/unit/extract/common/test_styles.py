@@ -14,6 +14,7 @@ import pytest
 from portolan_cli.extract.common.styles import (
     StyleExtractionError,
     _build_wms_getstyles_url,
+    _redact_url_for_logging,
     extract_esri_style,
     extract_wms_style,
 )
@@ -22,6 +23,26 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 pytestmark = pytest.mark.unit
+
+
+class TestRedactURLForLogging:
+    """Tests for query-string redaction before logging (security review)."""
+
+    def test_strips_api_key_from_query_string(self) -> None:
+        """An apikey query parameter is not present in the redacted URL."""
+        url = "https://example.com/geoserver/wms?service=WMS&apikey=SECRET123"
+        result = _redact_url_for_logging(url)
+
+        assert "SECRET123" not in result
+        assert "apikey" not in result
+        assert "?" not in result
+
+    def test_keeps_scheme_host_and_path(self) -> None:
+        """Scheme, host and path survive redaction."""
+        url = "https://example.com/geoserver/wms?apikey=SECRET123"
+        result = _redact_url_for_logging(url)
+
+        assert result == "https://example.com/geoserver/wms"
 
 
 class TestBuildWMSGetStylesURL:
@@ -120,6 +141,27 @@ class TestExtractWMSStyle:
         style = json.loads(result.path.read_text())
         assert style["version"] == 8
         assert len(style["layers"]) >= 1
+
+    def test_does_not_log_api_key(
+        self, tmp_path: Path, sample_sld: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An apikey on the WFS URL never reaches the debug log (security review)."""
+        collection_path = tmp_path / "test-collection"
+        collection_path.mkdir()
+
+        with (
+            caplog.at_level("DEBUG", logger="portolan_cli.extract.common.styles"),
+            patch("portolan_cli.extract.common.styles._fetch_wms_style") as mock_fetch,
+        ):
+            mock_fetch.return_value = sample_sld
+
+            extract_wms_style(
+                wfs_url="https://example.com/geoserver/wfs?apikey=SECRET123",
+                layer_name="test",
+                collection_path=collection_path,
+            )
+
+        assert "SECRET123" not in caplog.text
 
     def test_returns_none_on_fetch_failure(self, tmp_path: Path) -> None:
         """Returns None when WMS request fails."""
