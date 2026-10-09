@@ -42,6 +42,7 @@ from portolan_cli.extract.common.converters.sld import (
 from portolan_cli.json_io import write_json_atomic
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,7 @@ def _wfs_url_to_wms_path(wfs_url: str) -> tuple[str, str]:
 
 
 def _redact_url_for_logging(url: str) -> str:
-    """Strip query parameters from a URL before logging it.
+    """Strip userinfo and query parameters from a URL before logging it.
 
     URLs built from a WFS endpoint can carry sensitive values (e.g. an
     ``apikey``) in the query string. Logging only scheme, host and path
@@ -123,10 +124,14 @@ def _redact_url_for_logging(url: str) -> str:
         url: Full URL, possibly with a query string.
 
     Returns:
-        URL with the query string removed.
+        URL with userinfo and query string removed.
     """
     parsed = urlparse(url)
-    return urlunparse(parsed._replace(query=""))
+    host = parsed.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return urlunparse(parsed._replace(netloc=netloc, query=""))
 
 
 # Query parameter names (case-insensitive) that commonly carry a credential.
@@ -136,6 +141,7 @@ _CREDENTIAL_QUERY_PARAM_NAMES = frozenset(
     {
         "apikey",
         "api_key",
+        "api-key",
         "access_token",
         "token",
         "auth",
@@ -172,6 +178,48 @@ def _reject_credential_bearing_http_url(url: str) -> None:
         )
 
 
+def _credential_redirect_guard(url: str) -> Callable[[httpx.Request], None]:
+    """Build an httpx request hook that checks every hop, redirects included.
+
+    If the initial URL carries a credential, any non-HTTPS hop is rejected.
+    """
+    carries_credential = False
+    try:
+        # Probe as plain HTTP so the credential check runs regardless of scheme.
+        _reject_credential_bearing_http_url(urlunparse(urlparse(url)._replace(scheme="http")))
+    except StyleExtractionError:
+        carries_credential = True
+
+    def hook(request: httpx.Request) -> None:
+        if carries_credential and request.url.scheme != "https":
+            raise StyleExtractionError(
+                "Refusing to send a credential-bearing request to a non-HTTPS URL "
+                f"({_redact_url_for_logging(str(request.url))})."
+            )
+
+    return hook
+
+
+def _merge_query_params(query: str, overrides: dict[str, str]) -> str:
+    """Merge override params into a query string, matching names case-insensitively.
+
+    An existing parameter whose name matches an override, ignoring case (e.g.
+    ``SERVICE`` vs. ``service``), is replaced rather than duplicated.
+    Unrelated parameters are preserved as-is.
+
+    Args:
+        query: Original query string (without leading "?").
+        overrides: New parameter values keyed by (lowercase) parameter name.
+
+    Returns:
+        URL-encoded query string with overrides applied.
+    """
+    override_names = {name.lower() for name in overrides}
+    kept = [(name, value) for name, value in parse_qsl(query) if name.lower() not in override_names]
+    kept.extend(overrides.items())
+    return urlencode(kept)
+
+
 def _build_wms_getstyles_url(wfs_url: str, layer_name: str) -> str:
     """Build WMS GetStyles URL from WFS endpoint.
 
@@ -197,11 +245,9 @@ def _build_wms_getstyles_url(wfs_url: str, layer_name: str) -> str:
     }
 
     # Merge with the original query string so non-WMS parameters (e.g. an
-    # API key) survive; the new WMS parameters override same-named ones.
-    merged_params = dict(parse_qsl(parsed.query))
-    merged_params.update(params)
-
-    new_parsed = parsed._replace(path=path, query=urlencode(merged_params))
+    # API key) survive; the new WMS parameters override same-named ones,
+    # regardless of the original parameter's letter case.
+    new_parsed = parsed._replace(path=path, query=_merge_query_params(parsed.query, params))
     return urlunparse(new_parsed)
 
 
@@ -231,11 +277,9 @@ def _build_wms_getlegendgraphic_url(wfs_url: str, layer_name: str) -> str:
     }
 
     # Merge with the original query string so non-WMS parameters (e.g. an
-    # API key) survive; the new WMS parameters override same-named ones.
-    merged_params = dict(parse_qsl(parsed.query))
-    merged_params.update(params)
-
-    new_parsed = parsed._replace(path=path, query=urlencode(merged_params))
+    # API key) survive; the new WMS parameters override same-named ones,
+    # regardless of the original parameter's letter case.
+    new_parsed = parsed._replace(path=path, query=_merge_query_params(parsed.query, params))
     return urlunparse(new_parsed)
 
 
@@ -256,7 +300,11 @@ def _fetch_wms_style(url: str, timeout: float = 30.0) -> str:
     _reject_credential_bearing_http_url(url)
 
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+            event_hooks={"request": [_credential_redirect_guard(url)]},
+        ) as client:
             response = client.get(url)
             response.raise_for_status()
 
@@ -487,7 +535,11 @@ def _fetch_wms_legend(url: str, timeout: float = 30.0) -> bytes | None:
     try:
         _reject_credential_bearing_http_url(url)
 
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+            event_hooks={"request": [_credential_redirect_guard(url)]},
+        ) as client:
             response = client.get(url)
             response.raise_for_status()
 
