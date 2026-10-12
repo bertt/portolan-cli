@@ -40,8 +40,13 @@ before you change the plugin code.
 
 ## Built-in plugins use the same path
 
-- Define a built-in hook module in `portolan_cli/plugins/builtin/` and list it
-  in `manager._BUILTIN_MODULES`.
+- List each built-in hook module in `manager._BUILTIN_MODULES`, under the
+  name it registers as (`builtin:<name>`). A small shim goes in
+  `portolan_cli/plugins/builtin/`. A built-in plugin package, such as
+  `backends/iceberg/`, keeps its `hooks.py` in the package.
+- A command that portolan-cli provides through the plugin path goes in the
+  `portolan.commands` entry points in `pyproject.toml`. Help loads it for its
+  help text, so its module imports only Click and the public modules.
 - A plugin package imports only the public modules.
   `tests/unit/plugins/test_boundary.py` enforces it for each package in
   `PLUGIN_PACKAGES`. When a built-in plugin needs a private module, widen the
@@ -57,8 +62,10 @@ before you change the plugin code.
 - A backend that changes STAC JSON after the hooks run merges into the file
   on disk. Never call `pystac.Collection.save` there, because it drops the
   hook fields. `IcebergBackend.on_post_add` shows the pattern.
-- Backend precedence comes from `hook_calls`, which lists built-ins first.
-  Do not depend on pluggy call order.
+- Backend precedence comes from `hook_calls`. It lists the built-ins first in
+  registration order. The outside plugins follow in pluggy call order.
+  `builtin:legacy_backends` comes last. `tryfirst` and `trylast` cannot move
+  an outside plugin before a built-in.
 
 ## Example plugin
 

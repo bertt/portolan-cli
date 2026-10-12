@@ -101,6 +101,26 @@ def test_builtin_wins_a_name_collision_and_help_warns(installed: list[EntryPoint
     )
 
 
+def test_portolan_cli_entry_point_wins_a_name_collision(installed: list[EntryPoint]) -> None:
+    """An outside plugin cannot replace a command that portolan-cli declares.
+
+    The outside entry point comes first in discovery order, so the first-found
+    rule alone would pick it.
+    """
+    installed.append(_command("version.rollback", "commands:add"))
+    installed.append(_command("version.rollback", "commands:rollback", dist="portolan-cli"))
+    root = _root()
+
+    run_result = CliRunner().invoke(root, ["version", "rollback"])
+    help_result = CliRunner().invoke(root, ["version", "--help"])
+
+    assert run_result.output == "plugin rollback\n"
+    assert "Plugin command 'rollback' from portolan-example has the name of a built-in" in (
+        help_result.output
+    )
+    assert "(plugin: portolan-example)" not in help_result.output
+
+
 def test_load_failure_warns_and_leaves_no_command(installed: list[EntryPoint]) -> None:
     """A command that fails to import produces a warning, then Click's usual error."""
     installed.append(_command("broken", "broken:command"))
@@ -238,3 +258,17 @@ def test_disabled_plugin_command_stops_running_after_a_reset(
 
     assert result.exit_code == 2
     assert "No such command 'example'" in result.output
+
+
+def test_shipped_commands_leave_out_outside_plugins(installed: list[EntryPoint]) -> None:
+    """The generated reference documents portolan-cli's own commands only."""
+    installed.append(_command("version.rollback", "commands:rollback", dist="portolan-cli"))
+    installed.append(_command("version.extra", "commands:rollback"))
+    root = _root()
+    version = root.commands["version"]
+    assert isinstance(version, PluginGroup)
+    ctx = click.Context(version, info_name="version", parent=click.Context(root))
+
+    shipped = version.shipped_commands(ctx)
+
+    assert sorted(shipped) == ["list", "rollback"]

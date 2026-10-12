@@ -45,11 +45,13 @@ ENV_VAR = "PORTOLAN_PLUGINS"
 BUILTIN_DISTRIBUTION = "portolan-cli"
 BUILTIN_PREFIX = "builtin:"
 
-# Built-in hook modules. They implement the same hooks an outside plugin does.
-_BUILTIN_MODULES = (
-    "portolan_cli.plugins.builtin.backends",
-    "portolan_cli.plugins.builtin.legacy_backends",
-)
+# Built-in hook modules, registered as ``builtin:<name>``. They implement the
+# same hooks an outside plugin does.
+_BUILTIN_MODULES = {
+    "backends": "portolan_cli.plugins.builtin.backends",
+    "iceberg": "portolan_cli.backends.iceberg.hooks",
+    "legacy_backends": "portolan_cli.plugins.builtin.legacy_backends",
+}
 # Built-in modules that rank after the outside plugins. The deprecated backend
 # group holds third-party backends, so a hook plugin wins a name over it.
 _TRAILING_BUILTINS = frozenset({f"{BUILTIN_PREFIX}legacy_backends"})
@@ -130,7 +132,8 @@ def enabled_entry_points(group: str) -> list[EntryPoint]:
     """Return the entry points in ``group`` that ``PORTOLAN_PLUGINS`` enables.
 
     Entry points that portolan-cli declares always load. Two distributions can
-    declare the same name. The first one wins.
+    declare the same name. An entry point that portolan-cli declares wins the
+    name. Otherwise the first one in discovery order wins.
 
     Args:
         group: Entry point group name.
@@ -138,13 +141,35 @@ def enabled_entry_points(group: str) -> list[EntryPoint]:
     Returns:
         Entry points in discovery order, one per name.
     """
-    requested = _requested_names()
     selected: dict[str, EntryPoint] = {}
-    for ep in _scan(group):
-        if requested is not None and not is_builtin(ep) and not plugin_names(ep) & requested:
-            continue
-        selected.setdefault(ep.name, ep)
+    for ep in _enabled(group):
+        if ep.name not in selected or (is_builtin(ep) and not is_builtin(selected[ep.name])):
+            selected[ep.name] = ep
     return list(selected.values())
+
+
+def shadowed_entry_points(group: str) -> list[EntryPoint]:
+    """Return the enabled outside entry points that lose a name to portolan-cli.
+
+    Args:
+        group: Entry point group name.
+
+    Returns:
+        Outside entry points whose name portolan-cli also declares in ``group``.
+    """
+    enabled = _enabled(group)
+    own = {ep.name for ep in enabled if is_builtin(ep)}
+    return [ep for ep in enabled if not is_builtin(ep) and ep.name in own]
+
+
+def _enabled(group: str) -> list[EntryPoint]:
+    """Return every entry point in ``group`` that ``PORTOLAN_PLUGINS`` enables."""
+    requested = _requested_names()
+    return [
+        ep
+        for ep in _scan(group)
+        if requested is None or is_builtin(ep) or plugin_names(ep) & requested
+    ]
 
 
 def _warn(message: str) -> None:
@@ -210,11 +235,8 @@ def get_plugin_manager() -> pluggy.PluginManager:
 
     pm = pluggy.PluginManager(hookspecs.PROJECT_NAME)
     pm.add_hookspecs(hookspecs)
-    for module_name in _BUILTIN_MODULES:
-        pm.register(
-            importlib.import_module(module_name),
-            name=f"{BUILTIN_PREFIX}{module_name.rsplit('.', 1)[1]}",
-        )
+    for name, module_name in _BUILTIN_MODULES.items():
+        pm.register(importlib.import_module(module_name), name=f"{BUILTIN_PREFIX}{name}")
     _warn_unknown_requested_names()
     _register_outside_plugins(pm)
     _drop_plugins_with_unknown_hooks(pm)
@@ -233,7 +255,9 @@ def call_each(hook_name: str, **kwargs: Any) -> list[tuple[str, Any]]:
         **kwargs: Hook arguments.
 
     Returns:
-        ``(plugin_name, result)`` pairs in registration order, built-ins first.
+        ``(plugin_name, result)`` pairs in the order of ``hook_calls``. The
+        built-ins come first, then the outside plugins in pluggy call order.
+        ``builtin:legacy_backends`` comes last.
     """
     results: list[tuple[str, Any]] = []
     for plugin_name, call in hook_calls(hook_name):
