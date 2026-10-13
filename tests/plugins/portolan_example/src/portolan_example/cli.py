@@ -9,6 +9,7 @@ from pathlib import Path
 
 import click
 
+# --8<-- [start:command]
 from portolan_cli.api import info, success
 
 
@@ -37,3 +38,4 @@ def versions(collection: str, catalog_root: Path) -> None:
         return
     for version in history:
         success(f"{version.version}  {version.message}")
+    # --8<-- [end:command]
