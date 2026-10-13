@@ -87,6 +87,82 @@ A built-in name always wins:
 - A `portolan_backends` result that is not a mapping is ignored with a
   `PluginWarning`. `get_backend("file")` still resolves.
 
+## Format handlers
+
+Format handlers follow a different rule. A plugin handler comes before the
+built-in handler for the same extension, so a plugin can replace the COG
+conversion for `.tif`. `plugins/formats.py` `select_handler` applies this
+order:
+
+1. A pin in `.portolan/config.yaml`, such as `conversion.handlers: {.tif: cog}`.
+   A pin to a missing name raises `UnknownFormatHandlerError`.
+2. A plugin handler whose `extensions` hold the extension and whose `claims`
+   returns True. When more than one plugin handler claims the file,
+   `AmbiguousFormatError` names the pin to add.
+3. A built-in handler that claims the file.
+
+`FormatType` is gone. A format family is a plain string, because a plugin
+brings its own. The built-in families are `vector` and `raster`.
+
+A file that a plugin handler claims takes the plugin path. `prepare_item`
+calls the handler's `convert` and `read_metadata`, and the rest of `add` runs
+as for a built-in format of the same family and `asset_level`.
+`convert_file` returns the handler's output. `add`, `check --geo-assets`,
+`scan`, and `get_cloud_native_status` accept the extensions that plugin
+handlers register.
+
+`add` and `check --fix` convert through the same handler code. The built-in
+handlers live in `portolan_cli/formats_builtin`, one package per format, and
+import only `portolan_cli.api`. `preparation.convert_vector` and
+`preparation.convert_raster` are the one vector and one raster converter. The
+`add` safety features apply to both commands:
+
+- the fidelity gate
+- the rewrite temp marker
+- the schema metadata restore
+- the transient retry
+
+Partitioning follows the size rule and the index rule.
+
+- The size rule is in `partitioning.partition_strategy`, and only `add`
+  applies it, as before the merge. A file at or above `partitioning.threshold_gb` partitions into
+  Hive directories next to it. The file is removed only when the step wrote a
+  partition. A directory that already holds partitions for the strategy raises
+  `PartitionCollisionError`, because geoparquet-io does not write over a cell.
+  `add` then removes a converted file that the run wrote, so no row appears
+  twice. A file that existed before the run stays.
+  `check --fix` converts a source again on every run, so the size rule would
+  collide with its own earlier partitions there.
+- The index rule (`conversion.vector.partition`) applies only to
+  `check --fix`, as before the merge. `convert._convert_partitioned_by_index`
+  writes the partitions to `<output_dir>/<stem>/`. `add` writes one file with
+  the index column.
+
+The index rule keeps a directory per source. geoparquet-io names a Hive file
+after its cell and does not write over a cell that exists. In one shared
+directory, the second source lost every row in a cell that the first source
+wrote. Small files also failed in `add`, because geoparquet-io refuses
+partitions under 100 rows.
+
+The handler owns the per-format STAC logic. `describe_item` adds statistics,
+render fields, nodata defaults, and the item extensions. `describe_collection`
+adds the table extension. `inspect` answers `portolan info`. Core code uses
+the family only to group files in `scan` and to label them.
+
+The COG handler writes the raster thumbnail when it converts, because each
+raster is an item. It keeps a thumbnail that exists, so a re-add leaves a
+hand-made thumbnail in place. An old thumbnail also stays after the imagery
+changes. Delete it to get a new one. The GeoParquet handler writes no thumbnail. A collection
+can hold thousands of vector files, and `add` writes one thumbnail for the
+collection. `check --fix` no longer writes a thumbnail next to a converted
+vector file. A reference catalog built before and after the merge
+differs only in timestamps and in those `check --fix` thumbnails.
+
+`--force` without `--reconvert` keeps an existing output for every handler. The
+handler converts it again only when it reads that format. `--reconvert` on a
+file that is its own output calls the handler's `reconvert`. `check --fix
+--force` calls `reoptimize`, which only the COG handler has (issue #530).
+
 ## Enrichment runs on the files
 
 `portolan_enrich_item` and `portolan_enrich_collection` receive the STAC JSON

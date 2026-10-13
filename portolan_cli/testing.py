@@ -16,19 +16,146 @@ module follows semantic versioning, as ``portolan_cli.api`` does.
 
 from __future__ import annotations
 
+import contextlib
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, get_type_hints
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
-__all__ = ["ConformanceError", "check_backend"]
+__all__ = ["ConformanceError", "check_backend", "check_format_handler"]
 
 _COLLECTION = "conformance"
+_ASSET_LEVELS = frozenset({"collection", "item"})
 
 
 class ConformanceError(AssertionError):
     """A plugin object does not meet its protocol."""
+
+
+def check_format_handler(handler: Any, sample: Path, output_dir: Path) -> None:
+    """Check a format handler against ``FormatHandler`` with a sample file.
+
+    The check reads the handler attributes, converts ``sample`` into
+    ``output_dir``, and reads the metadata of the result.
+
+    Args:
+        handler: What ``portolan_formats`` returns.
+        sample: A small source file in a format the handler claims.
+        output_dir: An empty directory the handler may write to.
+
+    Raises:
+        ConformanceError: With one line per problem found.
+    """
+    from portolan_cli.plugins.formats import FormatHandler, FormatMetadata, extension_of
+
+    if not isinstance(handler, FormatHandler):
+        raise ConformanceError(f"{type(handler).__name__} does not implement FormatHandler.")
+
+    problems = _check_handler_attributes(handler)
+    if extension_of(sample) not in handler.extensions:
+        problems.append(f"extensions does not hold {extension_of(sample)}, the sample's.")
+    if not handler.claims(sample):
+        problems.append(f"claims returned False for the sample {sample.name}.")
+    if problems:
+        raise ConformanceError("\n".join(problems))
+
+    output = handler.convert(sample, output_dir, None)
+    if not isinstance(output, Path) or not output.exists():
+        raise ConformanceError(f"convert returned {output!r}, expected an existing Path.")
+
+    metadata = handler.read_metadata(output)
+    if not isinstance(metadata, FormatMetadata):
+        raise ConformanceError(
+            f"read_metadata returned {type(metadata).__name__}, expected FormatMetadata."
+        )
+    bbox = list(metadata.bbox or [])
+    if len(bbox) != 4 or not all(isinstance(v, (int, float)) for v in bbox):
+        problems.append(f"read_metadata bbox is {bbox!r}, expected four numbers.")
+    elif bbox[0] > bbox[2] or bbox[1] > bbox[3]:
+        problems.append(f"read_metadata bbox {bbox!r} has a minimum above its maximum.")
+    if not isinstance(metadata.to_stac_properties(), dict):
+        problems.append("to_stac_properties returned something other than a dict.")
+    if handler.output_path(sample, output_dir) != output:
+        problems.append("output_path does not name the file that convert wrote.")
+    problems += _check_describe(handler, sample, output, metadata, output_dir)
+    problems += _check_optional_methods(handler, output)
+    if problems:
+        raise ConformanceError("\n".join(problems))
+
+
+def _check_describe(
+    handler: Any, sample: Path, output: Path, metadata: Any, output_dir: Path
+) -> list[str]:
+    """Run ``describe_item``, ``describe_collection``, and ``inspect`` on stand-in objects."""
+    from datetime import datetime, timezone
+
+    import pystac
+
+    from portolan_cli.plugins.formats import FormatContext
+
+    context = FormatContext(catalog_root=output_dir, collection_dir=output_dir, source=sample)
+    problems: list[str] = []
+    bbox = [float(v) for v in metadata.bbox]
+    item = pystac.Item(
+        id="conformance",
+        geometry=None,
+        bbox=bbox,
+        datetime=datetime.now(timezone.utc),
+        properties=dict(metadata.to_stac_properties()),
+        assets={"data": pystac.Asset(href=f"./{output.name}", media_type=handler.media_type)},
+    )
+    handler.describe_item(item, output, metadata, context)
+    if item.id != "conformance" or "data" not in item.assets:
+        problems.append("describe_item removed the item id or its data asset.")
+    collection = pystac.Collection(
+        id="conformance",
+        description="Conformance check",
+        extent=pystac.Extent(
+            pystac.SpatialExtent([bbox]),
+            pystac.TemporalExtent([[datetime.now(timezone.utc), None]]),
+        ),
+    )
+    handler.describe_collection(collection, [metadata], context)
+    if collection.id != "conformance":
+        problems.append("describe_collection changed the collection id.")
+    # inspect may raise ValueError for a format ``portolan info`` does not read.
+    with contextlib.suppress(ValueError):
+        handler.inspect(output, None)
+    return problems
+
+
+def _check_optional_methods(handler: Any, output: Path) -> list[str]:
+    """Check ``partition`` and ``reoptimize`` when the handler has them."""
+    problems: list[str] = []
+    partition = getattr(handler, "partition", None)
+    if partition is not None and not isinstance(partition(output, None), list):
+        problems.append("partition returned something other than a list.")
+    for method_name in ("reoptimize", "reconvert"):
+        method = getattr(handler, method_name, None)
+        if method is not None and output.exists():
+            result = method(output, None)
+            if not isinstance(result, Path) or not result.exists():
+                problems.append(f"{method_name} returned {result!r}, expected an existing Path.")
+    return problems
+
+
+def _check_handler_attributes(handler: Any) -> list[str]:
+    problems: list[str] = []
+    for attribute in ("name", "family", "display_name", "media_type"):
+        value = getattr(handler, attribute)
+        if not isinstance(value, str) or not value:
+            problems.append(f"{attribute} is {value!r}, expected a non-empty string.")
+    extensions = handler.extensions
+    if not isinstance(extensions, frozenset) or not extensions:
+        problems.append("extensions must be a non-empty frozenset.")
+    else:
+        wrong = sorted(e for e in extensions if not e.startswith(".") or e != e.lower())
+        if wrong:
+            problems.append(f"extensions must be lowercase and start with a dot: {wrong}.")
+    if handler.asset_level not in _ASSET_LEVELS:
+        problems.append(f"asset_level is {handler.asset_level!r}, expected collection or item.")
+    return problems
 
 
 def check_backend(factory: Callable[..., Any], catalog_root: Path) -> None:
