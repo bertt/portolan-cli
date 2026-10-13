@@ -134,6 +134,8 @@ class TestCatalogWidePushIntermediateCatalogs:
     def test_uploads_intermediate_catalogs(
         self, mock_push: MagicMock, mock_obs_put: MagicMock, nested_catalog: Path
     ) -> None:
+        # The scaffolded AGENTS.md beside an intermediate catalog (#905, #935).
+        (nested_catalog / "tst" / "AGENTS.md").write_text("# tst agents\n")
         mock_push.return_value = PushResult(
             success=True, files_uploaded=1, versions_pushed=1, conflicts=[], errors=[]
         )
@@ -152,6 +154,7 @@ class TestCatalogWidePushIntermediateCatalogs:
         assert "catalog/tst/catalog.json" in uploaded_keys, uploaded_keys
         assert "catalog/tst/latest/catalog.json" in uploaded_keys, uploaded_keys
         assert "catalog/tst/README.md" in uploaded_keys, uploaded_keys
+        assert "catalog/tst/AGENTS.md" in uploaded_keys, uploaded_keys
 
     @patch("portolan_cli.sync.push.obs.put")
     @patch("portolan_cli.sync.push.push_async", new_callable=AsyncMock)
@@ -230,3 +233,165 @@ class TestSingleCollectionIntermediateCatalogs:
         out = capsys.readouterr().out
         assert "tst/catalog.json" in out
         assert "tst/latest/catalog.json" in out
+
+
+class TestIntermediateSidecarFiles:
+    """Every file beside an intermediate catalog.json reaches the remote (#905, #935).
+
+    The fixed name list held only catalog.json and README.md. The scaffolded
+    AGENTS.md, which the catalog's rel="agents" link names, was never uploaded.
+    """
+
+    def test_discovers_agents_md_beside_intermediate_catalog(self, nested_catalog: Path) -> None:
+        (nested_catalog / "tst" / "AGENTS.md").write_text("# tst agents\n")
+        (nested_catalog / "tst" / "latest" / "AGENTS.md").write_text("# latest agents\n")
+
+        files = _discover_intermediate_catalog_files(nested_catalog, ["tst/latest/adm0"])
+        rel = [f.relative_to(nested_catalog).as_posix() for f in files]
+
+        assert rel == [
+            "tst/catalog.json",
+            "tst/README.md",
+            "tst/AGENTS.md",
+            "tst/latest/catalog.json",
+            "tst/latest/AGENTS.md",
+        ]
+
+    def test_discovers_other_sidecar_files(self, nested_catalog: Path) -> None:
+        """A thumbnail or style beside the catalog is published like the root's."""
+        (nested_catalog / "tst" / "thumbnail.png").write_bytes(b"\x89PNG")
+        (nested_catalog / "tst" / "style.json").write_text("{}")
+
+        files = _discover_intermediate_catalog_files(nested_catalog, ["tst/latest/adm0"])
+        rel = {f.relative_to(nested_catalog).as_posix() for f in files}
+
+        assert {"tst/thumbnail.png", "tst/style.json"} <= rel
+
+    def test_excludes_secrets_symlinks_and_child_directories(self, nested_catalog: Path) -> None:
+        tst = nested_catalog / "tst"
+        (tst / ".env").write_text("SECRET=1\n")
+        (tst / "versions.json").write_text("{}")
+        (tst / "linked.md").symlink_to(nested_catalog / "catalog.json")
+
+        files = _discover_intermediate_catalog_files(nested_catalog, ["tst/latest/adm0"])
+        rel = {f.relative_to(nested_catalog).as_posix() for f in files}
+
+        assert "tst/.env" not in rel
+        assert "tst/versions.json" not in rel
+        assert "tst/linked.md" not in rel
+        # The child collection's own files belong to its walk, not this one.
+        assert not any(r.startswith("tst/latest/adm0/") for r in rel)
+
+    def test_keeps_file_named_after_its_directory(self, nested_catalog: Path) -> None:
+        """The STAC item heuristic must not drop tst/tst.json at a catalog level."""
+        (nested_catalog / "tst" / "tst.json").write_text("{}")
+
+        files = _discover_intermediate_catalog_files(nested_catalog, ["tst/latest/adm0"])
+        rel = {f.relative_to(nested_catalog).as_posix() for f in files}
+
+        assert "tst/tst.json" in rel
+
+    def test_every_local_link_target_of_scaffolded_catalogs_is_discovered(
+        self, tmp_path: Path
+    ) -> None:
+        """The uploaded set covers the linked set, so no published link dangles."""
+        from portolan_cli.catalog import create_intermediate_catalogs
+        from portolan_cli.stac_links import iter_links
+
+        _setup_valid_catalog(tmp_path)
+        _write_catalog_json(tmp_path / "catalog.json", "root")
+        create_intermediate_catalogs("env/air/quality", tmp_path)
+        (tmp_path / "env" / "README.md").write_text("# env\n")
+
+        discovered = set(_discover_intermediate_catalog_files(tmp_path, ["env/air/quality"]))
+
+        structural = {"root", "parent", "self", "child", "item"}
+        for sub in ("env", "env/air"):
+            catalog_json = tmp_path / sub / "catalog.json"
+            data = json.loads(catalog_json.read_text())
+            rels = {link["rel"] for link in data["links"]} - structural
+            assert "agents" in rels
+            for _link, href, path in iter_links(data, catalog_json.parent, rels):
+                if "://" in href:
+                    continue
+                assert path in discovered, f"{sub}: {href} is linked but not uploaded"
+
+    def test_single_collection_push_includes_intermediate_agents_md(
+        self, nested_catalog: Path
+    ) -> None:
+        (nested_catalog / "tst" / "AGENTS.md").write_text("# tst agents\n")
+
+        stac_files = _discover_stac_files(nested_catalog, "tst/latest/adm0", include_catalog=True)
+        uploaded = {
+            p.relative_to(nested_catalog).as_posix()
+            for key in ("catalog", "readmes")
+            for p in stac_files[key]
+        }
+
+        assert "tst/AGENTS.md" in uploaded
+
+
+def _push_unchanged_collection(
+    catalog_root: Path, collection: str, *, include_catalog: bool
+) -> tuple[PushResult, list[str]]:
+    """Push a collection whose remote versions.json equals the local one."""
+    import asyncio
+
+    from portolan_cli.sync.push import push_async
+
+    local_versions = json.loads((catalog_root / collection / "versions.json").read_text())
+    uploaded_keys: list[str] = []
+
+    async def record_put(store: object, key: str, content: object, **kwargs: object) -> None:
+        uploaded_keys.append(key)
+
+    remote = AsyncMock(return_value=(local_versions, "etag-1"))
+    store = MagicMock(return_value=(MagicMock(), "prefix"))
+    with (
+        patch.multiple(
+            "portolan_cli.sync.push", setup_store=store, _fetch_remote_versions_async=remote
+        ),
+        patch("portolan_cli.sync.push.obs.put_async", new=record_put),
+    ):
+        result = asyncio.run(
+            push_async(
+                catalog_root=catalog_root,
+                collection=collection,
+                destination="s3://bucket/catalog",
+                include_catalog=include_catalog,
+                json_mode=True,
+            )
+        )
+    return result, uploaded_keys
+
+
+class TestMetadataOnlyPushIntermediateFiles:
+    """A push with no new version still syncs intermediate files (#816, #905).
+
+    An edited intermediate AGENTS.md bumps no version. A standalone push takes
+    the metadata-only path, which must upload it like a root or collection file.
+    """
+
+    def test_standalone_push_uploads_intermediate_agents_md(self, nested_catalog: Path) -> None:
+        (nested_catalog / "tst" / "AGENTS.md").write_text("# edited agents\n")
+
+        result, keys = _push_unchanged_collection(
+            nested_catalog, "tst/latest/adm0", include_catalog=True
+        )
+
+        assert result.success is True
+        assert result.versions_pushed == 0
+        assert "prefix/tst/AGENTS.md" in keys, keys
+        assert "prefix/tst/latest/catalog.json" in keys, keys
+
+    def test_catalog_wide_member_push_leaves_intermediates_to_root_phase(
+        self, nested_catalog: Path
+    ) -> None:
+        """include_catalog=False: _push_all_upload_root_files uploads them once."""
+        (nested_catalog / "tst" / "AGENTS.md").write_text("# edited agents\n")
+
+        _result, keys = _push_unchanged_collection(
+            nested_catalog, "tst/latest/adm0", include_catalog=False
+        )
+
+        assert not any(k.startswith("prefix/tst/") and "/adm0/" not in k for k in keys), keys

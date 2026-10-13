@@ -71,8 +71,8 @@ def init_extracted_catalog(
 ) -> list[Path] | None:
     """Initialize a catalog and add the extracted assets.
 
-    Shared core of every orchestrator's ``_auto_init_catalog``: collect assets,
-    bail out if there are none, initialize the catalog, run an optional
+    Shared core of ``build_catalog`` and the ImageServer catalog step: collect
+    assets, bail out if there are none, initialize the catalog, run an optional
     ``post_init`` hook (used for source-specific work that must happen *after*
     ``init_catalog`` but *before* ``add_files`` — e.g. re-applying richer catalog
     metadata, or enabling tabular support for non-geo outputs), then add the
@@ -101,7 +101,8 @@ def init_extracted_catalog(
         The list of added parquet files, or ``None`` when there was nothing to
         add (the caller should then stop — no catalog was created).
     """
-    from portolan_cli.catalog import CatalogState, add_files, detect_state, init_catalog
+    from portolan_cli.add import add_files
+    from portolan_cli.catalog import CatalogState, detect_state, init_catalog
     from portolan_cli.output import warn
 
     parquet_files = collect_successful_parquet_files(output_dir, report)

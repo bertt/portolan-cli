@@ -30,25 +30,24 @@ from portolan_cli.conversion_config import (
     get_cog_settings,
     get_vector_settings,
     resolve_cog_settings,
+    settings_override,
 )
 from portolan_cli.errors import (
     ConversionFailedError,
+    InvalidOutputError,
 )
 from portolan_cli.formats import (
     CloudNativeStatus,
-    FormatType,
-    detect_format,
     get_cloud_native_status,
 )
 from portolan_cli.viz.thumbnail import (
-    ThumbnailConfig,
-    generate_vector_thumbnail,
-    get_thumbnail_config,
     thumbnail_path_for,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from portolan_cli.plugins.formats import FormatHandler
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +331,7 @@ def _early_exit_result(
     *,
     force: bool,
     start_time: float,
+    catalog_path: Path | None = None,
 ) -> ConversionResult | None:
     """Return a SKIPPED/UNSUPPORTED result if no conversion should run, else None.
 
@@ -341,8 +341,11 @@ def _early_exit_result(
     Unsupported formats are accepted with no error.
     """
     if format_info.status == CloudNativeStatus.CLOUD_NATIVE:
-        force_raster = force and detect_format(source) == FormatType.RASTER
-        if force_raster:
+        # --force re-optimizes a file whose handler can rewrite it (issue #530).
+        from portolan_cli.plugins.formats import handler_for
+
+        handler = handler_for(source, catalog_path) if force else None
+        if handler is not None and hasattr(handler, "reoptimize"):
             return None
         duration_ms = int((time.perf_counter() - start_time) * 1000)
         return ConversionResult(
@@ -416,132 +419,195 @@ def convert_file(
     if not source.exists():
         raise FileNotFoundError(f"Source file not found: {source}")
 
-    # Get format info
-    format_info = get_cloud_native_status(source)
+    from portolan_cli.plugins.formats import handler_for, plugin_handler_for
 
-    # Cloud-native (skip, unless forcing raster re-optimization) and unsupported
-    # files exit early without conversion.
-    early_exit = _early_exit_result(source, format_info, force=force, start_time=start_time)
-    if early_exit is not None:
-        return early_exit
-
-    # Determine output directory and format type
-    out_dir = output_dir or source.parent
-    format_type = detect_format(source)
-
-    # Load COG settings: explicit arg > catalog config > defaults
-    if cog_settings is None:
-        cog_settings = get_cog_settings(catalog_path) if catalog_path else CogSettings()
-
-    # Load vector settings: explicit arg > catalog config > defaults
-    if vector_settings is None:
-        vector_settings = get_vector_settings(catalog_path) if catalog_path else VectorSettings()
-
-    # Convert based on format type
-    try:
-        if format_type == FormatType.VECTOR:
-            output_path = _convert_vector(source, out_dir, vector_settings)
-            target_format = "GeoParquet"
-            # Validate output is valid GeoParquet
-            validation_error = _validate_geoparquet(output_path)
-            # Generate thumbnail next to the GeoParquet (Issue #13).
-            # Only on a successful, valid conversion to avoid orphan thumbnails.
-            # Thumbnail failure should not flip a successful conversion to FAILED.
-            if validation_error is None:
-                try:
-                    thumb_config = (
-                        get_thumbnail_config(catalog_path) if catalog_path else ThumbnailConfig()
-                    )
-                    if thumb_config.enabled and isinstance(output_path, Path):
-                        # Discover style for thumbnail (Issue #495)
-                        style_path = _discover_style_for_thumbnail(output_path.parent)
-                        generate_vector_thumbnail(
-                            pmtiles_path=None,  # PMTiles generated separately if enabled
-                            geoparquet_path=output_path,
-                            config=thumb_config,
-                            style_path=style_path,
-                        )
-                except Exception as e:
-                    logger.warning("Thumbnail generation failed for %s: %s", source.name, e)
-        elif format_type == FormatType.RASTER:
-            output_path = _convert_raster(source, out_dir, cog_settings)
-            target_format = "COG"
-            # Validate output is valid COG
-            validation_error = _validate_cog(output_path)
-            # Generate thumbnail next to the COG (Issue #372).
-            # Only on a successful, valid conversion to avoid orphan thumbnails.
-            if validation_error is None and cog_settings.generate_thumbnail:
-                generate_cog_thumbnail(
-                    output_path,
-                    max_size=cog_settings.thumbnail_max_size,
-                    quality=cog_settings.thumbnail_quality,
-                )
-        else:
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
-            return ConversionResult(
-                source=source,
-                output=None,
-                format_from=format_info.display_name,
-                format_to=None,
-                status=ConversionStatus.FAILED,
-                error=f"Unable to determine format type for {source.suffix}",
-                duration_ms=duration_ms,
-            )
-
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
-
-        # Check validation result
-        if validation_error is not None:
-            logger.warning(
-                "Conversion completed but validation failed for %s: %s",
-                output_path,
-                validation_error,
-            )
-            return ConversionResult(
-                source=source,
-                output=output_path,  # Keep output for inspection
-                format_from=format_info.display_name,
-                format_to=target_format,
-                status=ConversionStatus.INVALID,
-                error=validation_error,
-                duration_ms=duration_ms,
-            )
-
-        return ConversionResult(
-            source=source,
-            output=output_path,
-            format_from=format_info.display_name,
-            format_to=target_format,
-            status=ConversionStatus.SUCCESS,
-            error=None,
-            duration_ms=duration_ms,
+    # A plugin format handler converts the formats it claims (#947). A built-in
+    # format first passes the cloud-native check.
+    handler = plugin_handler_for(source, catalog_path)
+    reoptimize = False
+    display_name = handler.display_name if handler is not None else ""
+    if handler is None:
+        format_info = get_cloud_native_status(source, catalog_path)
+        early_exit = _early_exit_result(
+            source, format_info, force=force, start_time=start_time, catalog_path=catalog_path
         )
-
-    except Exception as e:
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
-        # Use structured error for logging context
-        conversion_error = ConversionFailedError(str(source), e)
-        logger.exception(
-            "Conversion failed for %s [%s]: %s",
+        if early_exit is not None:
+            return early_exit
+        reoptimize = format_info.status == CloudNativeStatus.CLOUD_NATIVE
+        display_name = format_info.display_name
+        handler = handler_for(source, catalog_path)
+    if handler is None:
+        return _result(
             source,
-            conversion_error.code,
-            e,
-        )
-        return ConversionResult(
-            source=source,
-            output=None,
-            format_from=format_info.display_name,
-            format_to=format_info.target_format,
-            status=ConversionStatus.FAILED,
-            error=str(e),
-            duration_ms=duration_ms,
+            None,
+            display_name,
+            None,
+            ConversionStatus.FAILED,
+            f"Unable to determine format type for {source.suffix}",
+            start_time,
         )
 
+    out_dir = output_dir or source.parent
+    with settings_override(cog=cog_settings, vector=vector_settings):
+        try:
+            partitioned = (
+                None
+                if reoptimize
+                else _convert_partitioned_by_index(handler, source, out_dir, catalog_path)
+            )
+            # The size partition rule belongs to `add` only, as before #947.
+            # This path converts a source again on every run, and a second
+            # size partition into the same directory would collide.
+            output_path = partitioned or convert_with_handler(
+                handler, source, out_dir, catalog_path, reoptimize=reoptimize
+            )
+        except InvalidOutputError as err:
+            logger.warning("Conversion completed but validation failed: %s", err)
+            return _result(
+                source,
+                Path(str(err.context["path"])),
+                display_name,
+                handler.display_name,
+                ConversionStatus.INVALID,
+                err.reason,
+                start_time,
+            )
+        except Exception as e:
+            conversion_error = ConversionFailedError(str(source), e)
+            logger.exception("Conversion failed for %s [%s]: %s", source, conversion_error.code, e)
+            return _result(
+                source,
+                None,
+                display_name,
+                handler.display_name,
+                ConversionStatus.FAILED,
+                str(e),
+                start_time,
+            )
 
-#: Total attempts for a single vector conversion when it fails with a transient
-#: DuckDB interrupt (1 initial try + retries). Small on purpose: a genuine
-#: interrupt clears once raised, so one extra attempt almost always suffices.
+    return _result(
+        source,
+        output_path,
+        display_name,
+        handler.display_name,
+        ConversionStatus.SUCCESS,
+        None,
+        start_time,
+    )
+
+
+def _result(
+    source: Path,
+    output: Path | None,
+    format_from: str,
+    format_to: str | None,
+    status: ConversionStatus,
+    error: str | None,
+    start_time: float,
+) -> ConversionResult:
+    return ConversionResult(
+        source=source,
+        output=output,
+        format_from=format_from,
+        format_to=format_to,
+        status=status,
+        error=error,
+        duration_ms=int((time.perf_counter() - start_time) * 1000),
+    )
+
+
+def convert_with_handler(
+    handler: FormatHandler,
+    source: Path,
+    output_dir: Path,
+    catalog_root: Path | None,
+    *,
+    reoptimize: bool = False,
+) -> Path:
+    """Convert ``source`` with its format handler. ``add`` and ``check --fix`` both call this.
+
+    Args:
+        handler: The handler ``handler_for`` picked.
+        source: Source file.
+        output_dir: Directory for the converted file.
+        catalog_root: Catalog root, for settings.
+        reoptimize: Rewrite a file that is already cloud-native. Only a handler
+            with a ``reoptimize`` method supports it.
+
+    Returns:
+        The converted file.
+
+    Raises:
+        InvalidOutputError: The converted file fails the handler's validation.
+    """
+    reoptimize_method = getattr(handler, "reoptimize", None)
+    if reoptimize and reoptimize_method is not None:
+        output: Path = reoptimize_method(source, catalog_root)
+        return output
+    return handler.convert(source, output_dir, catalog_root)
+
+
+def _convert_partitioned_by_index(
+    handler: FormatHandler, source: Path, output_dir: Path, catalog_root: Path | None
+) -> Path | None:
+    """Convert a vector source into Hive partitions by the configured spatial index.
+
+    Only ``check --fix`` does this, and only for the built-in GeoParquet
+    handler. ``add`` keeps one file with the index column. The partitions go
+    to ``<output_dir>/<stem>/``, so two sources in one directory cannot write
+    to the same cell.
+
+    Returns:
+        The partition directory, or None when the settings ask for no
+        partitions or the handler is not the built-in GeoParquet handler.
+
+    Raises:
+        InvalidOutputError: The partitions are not valid GeoParquet.
+    """
+    from portolan_cli.plugins.formats import handler_named
+    from portolan_cli.preparation import convert_vector
+
+    if handler is not handler_named("geoparquet") or source.suffix.lower() == ".parquet":
+        return None
+    settings = get_vector_settings(catalog_root)
+    if not (settings.partition and settings.spatial_index != "none"):
+        return None
+    output = convert_vector(
+        source, output_dir, catalog_root, partition_dir=output_dir / source.stem
+    )
+    error = validate_geoparquet(output)
+    if error is not None:
+        raise InvalidOutputError(str(output), error)
+    return output
+
+
 _CONVERT_MAX_ATTEMPTS = 3
+
+
+def write_raster_thumbnail(cog_path: Path, catalog_root: Path | None) -> None:
+    """Write ``<stem>.thumb.jpg`` next to a COG when the COG settings ask for it.
+
+    A thumbnail that exists stays, so a re-add keeps a hand-made thumbnail.
+    Portolan cannot tell a hand-made thumbnail from one it wrote, so an old
+    thumbnail also stays after the imagery changes. Delete ``<stem>.thumb.jpg``
+    to make the next conversion write a new one. A thumbnail is optional, so a
+    failure only warns.
+
+    Args:
+        cog_path: The COG.
+        catalog_root: Catalog root, for the COG settings.
+    """
+    settings = get_cog_settings(catalog_root)
+    if not settings.generate_thumbnail:
+        return
+    if cog_path.with_name(f"{cog_path.stem}.thumb.jpg").exists():
+        return
+    try:
+        generate_cog_thumbnail(
+            cog_path, max_size=settings.thumbnail_max_size, quality=settings.thumbnail_quality
+        )
+    except Exception as e:  # noqa: BLE001 - the thumbnail is optional
+        logger.warning("Thumbnail generation failed for %s: %s", cog_path.name, e)
 
 
 def _is_transient_conversion_error(exc: BaseException) -> bool:
@@ -581,8 +647,8 @@ def run_with_transient_convert_retry(
     the first occurrence.
 
     Shared by every conversion entry point the ``add`` pipeline uses
-    (:func:`_convert_vector`, :func:`_convert_vector_layer`, and
-    ``preparation.convert_vector`` / ``preparation.convert_tabular``) so the
+    (:func:`_convert_vector_layer`, ``preparation.convert_vector``, and
+    ``preparation.convert_tabular``) so the
     retry is applied uniformly rather than on a single code path (Issue #339
     nightly ``test_add_1000_files_*`` flake).
 
@@ -666,60 +732,6 @@ def repair_shapefile_encoding_sidecar(shp: Path) -> Path | None:
     return None
 
 
-def _convert_vector(
-    source: Path,
-    output_dir: Path,
-    settings: VectorSettings | None = None,
-) -> Path:
-    """Convert a vector file to GeoParquet with optional spatial optimization.
-
-    Uses geoparquet-io's fluent Table API to apply spatial index columns,
-    sorting, and bbox based on VectorSettings configuration.
-
-    A transient DuckDB "Query interrupted" failure (see
-    :func:`_is_transient_conversion_error`) is retried up to
-    ``_CONVERT_MAX_ATTEMPTS`` times so a single interrupted query does not fail a
-    whole bulk ``add``; any other error propagates on the first occurrence.
-
-    Args:
-        source: Source vector file.
-        output_dir: Directory for output file.
-        settings: Vector conversion settings. If None, uses defaults (no optimization).
-
-    Returns:
-        Path to the output GeoParquet file (or directory if partitioned).
-    """
-    import geoparquet_io as gpio  # type: ignore[import-untyped]
-
-    if settings is None:
-        settings = VectorSettings()
-    resolved = settings
-
-    if source.suffix.lower() == ".shp":
-        repair_shapefile_encoding_sidecar(source)
-
-    output_path = output_dir / f"{source.stem}.parquet"
-
-    def _run() -> Path:
-        # Convert source to gpio Table
-        table = gpio.convert(str(source))
-
-        # Apply spatial optimizations based on settings
-        table = apply_vector_settings(table, resolved)
-
-        # Write output (partitioned or single file)
-        if resolved.partition and resolved.spatial_index != "none":
-            # Partitioned output to directory
-            partition_dir = output_dir / source.stem
-            _write_partitioned(table, partition_dir, resolved)
-            return partition_dir
-        # Single file output
-        table.write(str(output_path))
-        return output_path
-
-    return run_with_transient_convert_retry(_run, source_name=source.name)
-
-
 def has_geometry(table: Any) -> bool:
     """Report whether a gpio Table carries a geometry column.
 
@@ -740,7 +752,9 @@ def has_geometry(table: Any) -> bool:
     return getattr(table, "geometry_column", "geometry") is not None
 
 
-def apply_vector_settings(table: Any, settings: VectorSettings) -> Any:
+def apply_vector_settings(
+    table: Any, settings: VectorSettings, *, partitioned: bool = False
+) -> Any:
     """Apply spatial optimization settings to a gpio Table.
 
     A table with no geometry column is returned untouched. Sorting and the
@@ -750,6 +764,9 @@ def apply_vector_settings(table: Any, settings: VectorSettings) -> Any:
     Args:
         table: geoparquet-io Table instance.
         settings: Vector conversion settings.
+        partitioned: True when the caller writes the table with
+            ``_write_partitioned``. The partition call then adds the spatial
+            index column itself, at the size it partitions by.
 
     Returns:
         Modified Table with optimizations applied.
@@ -761,8 +778,10 @@ def apply_vector_settings(table: Any, settings: VectorSettings) -> Any:
     if settings.add_bbox:
         table = table.add_bbox()
 
-    # Add spatial index column if specified
-    if settings.spatial_index != "none":
+    # Add spatial index column if specified. geoparquet-io partitions on an
+    # existing column at that column's resolution, so a column added here
+    # would bypass the `auto` sizing of a partitioned write.
+    if settings.spatial_index != "none" and not partitioned:
         resolution = _resolve_resolution(settings.resolution)
         table = _add_spatial_index(table, settings.spatial_index, resolution)
 
@@ -819,22 +838,51 @@ def _add_spatial_index(table: Any, index_type: str, resolution: int | None) -> A
     if index_type == "a5":
         return table.add_a5() if resolution is None else table.add_a5(resolution=resolution)
     if index_type == "kdtree":
-        return table.add_kdtree() if resolution is None else table.add_kdtree(iterations=resolution)
+        # geoparquet-io 1.5 requires a size or `auto` for kdtree (geoparquet-io#855).
+        if resolution is None:
+            return table.add_kdtree(auto=True)
+        return table.add_kdtree(iterations=resolution)
     raise ValueError(
         f"Unknown spatial index type: '{index_type}'. Valid types: h3, s2, quadkey, a5, kdtree"
     )
 
 
+# The keyword each geoparquet-io partition method uses for its cell size.
+_PARTITION_SIZE_KWARG = {
+    "h3": "resolution",
+    "s2": "level",
+    "quadkey": "resolution",
+    "a5": "resolution",
+    "kdtree": "iterations",
+}
+
+# Quadkey partitions group cells by a prefix of the quadkey column. geoparquet-io
+# 1.5 made the prefix length required next to an explicit resolution
+# (geoparquet-io#800). 6 is the length that geoparquet-io 1.4 used by default.
+_QUADKEY_PARTITION_RESOLUTION = 6
+
+
 def _write_partitioned(table: Any, output_dir: Path, settings: VectorSettings) -> None:
     """Write table as hive-partitioned output.
+
+    ``resolution: auto`` passes ``auto=True``, which sizes the cells from the
+    row count. geoparquet-io 1.5 refuses a partition call that names neither a
+    size nor ``auto`` (geoparquet-io#800, #855).
 
     Args:
         table: geoparquet-io Table instance with spatial index column.
         output_dir: Output directory for partitioned files.
         settings: Vector settings with partition strategy.
     """
-    resolution = _resolve_resolution(settings.resolution)
     index_type = settings.spatial_index
+    size_kwarg = _PARTITION_SIZE_KWARG.get(index_type)
+    if size_kwarg is None:
+        return
+
+    resolution = _resolve_resolution(settings.resolution)
+    sizing: dict[str, Any] = {"auto": True} if resolution is None else {size_kwarg: resolution}
+    if index_type == "quadkey" and resolution is not None:
+        sizing["partition_resolution"] = min(resolution, _QUADKEY_PARTITION_RESOLUTION)
 
     # geoparquet-io 1.4.0 changed the Python API default for `hive` from True to
     # False (gpio#661). Portolan needs the Hive layout: each partition directory
@@ -842,43 +890,15 @@ def _write_partitioned(table: Any, output_dir: Path, settings: VectorSettings) -
     # `<scheme>_cell=*`. Pass both flags at every call so a later default change
     # cannot alter the layout again. `keep_*_column` keeps partition pruning
     # available to a reader, which `partitioning.partition_file` already does.
-    if index_type == "h3":
-        if resolution is None:
-            table.partition_by_h3(str(output_dir), hive=True, keep_h3_column=True)
-        else:
-            table.partition_by_h3(
-                str(output_dir), resolution=resolution, hive=True, keep_h3_column=True
-            )
-    elif index_type == "s2":
-        if resolution is None:
-            table.partition_by_s2(str(output_dir), hive=True, keep_s2_column=True)
-        else:
-            table.partition_by_s2(str(output_dir), level=resolution, hive=True, keep_s2_column=True)
-    elif index_type == "quadkey":
-        if resolution is None:
-            table.partition_by_quadkey(str(output_dir), hive=True, keep_quadkey_column=True)
-        else:
-            table.partition_by_quadkey(
-                str(output_dir), resolution=resolution, hive=True, keep_quadkey_column=True
-            )
-    elif index_type == "a5":
-        if resolution is None:
-            table.partition_by_a5(str(output_dir), hive=True, keep_a5_column=True)
-        else:
-            table.partition_by_a5(
-                str(output_dir), resolution=resolution, hive=True, keep_a5_column=True
-            )
-    elif index_type == "kdtree":
-        if resolution is None:
-            table.partition_by_kdtree(str(output_dir), hive=True, keep_kdtree_column=True)
-        else:
-            table.partition_by_kdtree(
-                str(output_dir), iterations=resolution, hive=True, keep_kdtree_column=True
-            )
+    partition = getattr(table, f"partition_by_{index_type}")
+    partition(str(output_dir), hive=True, **{f"keep_{index_type}_column": True}, **sizing)
 
 
-def _convert_raster(source: Path, output_dir: Path, settings: CogSettings | None = None) -> Path:
-    """Convert a raster file to COG.
+def write_cog(source: Path, output_dir: Path, settings: CogSettings | None = None) -> Path:
+    """Write a raster file as a COG with the given settings.
+
+    ``preparation.convert_raster`` decides when to call this. It keeps a
+    source that is already a COG unless the operator asks to re-optimize.
 
     Uses COG settings from config if provided, otherwise the built-in defaults:
     - DEFLATE compression
@@ -973,7 +993,7 @@ def _convert_raster(source: Path, output_dir: Path, settings: CogSettings | None
     return output_path
 
 
-def _validate_geoparquet(path: Path) -> str | None:
+def validate_geoparquet(path: Path) -> str | None:
     """Validate that the output is valid GeoParquet (file or partitioned directory).
 
     Args:
@@ -1020,7 +1040,7 @@ def _validate_partitioned_geoparquet(partition_dir: Path) -> str | None:
     return None
 
 
-def _validate_cog(path: Path) -> str | None:
+def validate_cog(path: Path) -> str | None:
     """Validate that the output file is a valid COG.
 
     Args:
@@ -1356,7 +1376,7 @@ def convert_multilayer_file(
             _convert_vector_layer(source, layer_name, output_path, settings)
 
             # Validate output
-            validation_error = _validate_geoparquet(output_path)
+            validation_error = validate_geoparquet(output_path)
             if validation_error:
                 results.append(
                     LayerConversionResult(
@@ -1411,7 +1431,7 @@ def _convert_vector_layer(
     Raises:
         Exception: If conversion fails.
     """
-    import geoparquet_io as gpio
+    import geoparquet_io as gpio  # type: ignore[import-untyped]
 
     if settings is None:
         settings = VectorSettings()

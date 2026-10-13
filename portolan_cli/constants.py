@@ -23,6 +23,24 @@ from portolan_cli import extension_registry as _reg
 # from versions.SPEC_VERSION, which versions the versions.json manifest schema.
 PORTOLAN_SPEC_VERSION: str = max(bundled_schema_versions()).removeprefix("v")
 
+# STAC version we generate (v1.1.0 has unified bands array, superseding
+# eo:bands/raster:bands). It lives here, not in stac.py, so the models package
+# can read it without loading pystac (issue #944).
+STAC_VERSION: str = "1.1.0"
+
+# Files that Portolan writes into a collection directory. ``status`` and
+# ``list`` do not report one of them as untracked data (issue #944).
+MANAGED_FILES: frozenset[str] = frozenset(
+    {
+        "versions.json",
+        "collection.json",
+        "catalog.json",
+        "README.md",
+        "AGENTS.md",
+        "metadata.yaml",
+    }
+)
+
 # The versioned Portolan profile schema URI every catalog and collection
 # declares in ``stac_extensions`` (issue #654; rashid PTL-CNF-001/002). Its
 # shape is fixed by the validator's pattern
@@ -88,13 +106,6 @@ REMOVED_PORTOLAN_FIELDS: tuple[str, ...] = (
 # never a URI the validator accepted.
 PARTITION_EXTENSION_URI: str = (
     "https://schemas.portolan-sdi.org/incubating/partition/v1.0.0/schema.json"
-)
-
-# The Iceberg extension a collection published as an Iceberg table declares.
-# portolan-spec pins it under incubating/iceberg, next to the partition
-# extension, and serves it from the same host.
-ICEBERG_EXTENSION_URI: str = (
-    "https://schemas.portolan-sdi.org/incubating/iceberg/v1.1.0/schema.json"
 )
 
 # The extension vocabulary below is DERIVED from portolan_cli.extension_registry
