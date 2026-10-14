@@ -200,6 +200,24 @@ def _credential_redirect_guard(url: str) -> Callable[[httpx.Request], None]:
     return hook
 
 
+def _guarded_get(url: str, timeout: float) -> httpx.Response:
+    """GET a URL, following redirects with the credential redirect guard applied.
+
+    Raises:
+        httpx.HTTPStatusError: On a non-2xx response.
+        httpx.RequestError: On a transport error.
+        StyleExtractionError: If a hop would send a credential over non-HTTPS.
+    """
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=True,
+        event_hooks={"request": [_credential_redirect_guard(url)]},
+    ) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        return response
+
+
 def _merge_query_params(query: str, overrides: dict[str, str]) -> str:
     """Merge override params into a query string, matching names case-insensitively.
 
@@ -300,27 +318,18 @@ def _fetch_wms_style(url: str, timeout: float = 30.0) -> str:
     _reject_credential_bearing_http_url(url)
 
     try:
-        with httpx.Client(
-            timeout=timeout,
-            follow_redirects=True,
-            event_hooks={"request": [_credential_redirect_guard(url)]},
-        ) as client:
-            response = client.get(url)
-            response.raise_for_status()
+        response = _guarded_get(url, timeout)
+        content_type = response.headers.get("content-type", "")
 
-            content_type = response.headers.get("content-type", "")
+        # Check for XML response (SLD)
+        if "xml" in content_type or response.text.strip().startswith("<?xml"):
+            return response.text
 
-            # Check for XML response (SLD)
-            if "xml" in content_type or response.text.strip().startswith("<?xml"):
-                return response.text
+        # Check for error response
+        if "ServiceException" in response.text:
+            raise StyleExtractionError(f"WMS GetStyles returned error: {response.text[:200]}")
 
-            # Check for error response
-            if "ServiceException" in response.text:
-                raise StyleExtractionError(f"WMS GetStyles returned error: {response.text[:200]}")
-
-            raise StyleExtractionError(
-                f"Unexpected content type from WMS GetStyles: {content_type}"
-            )
+        raise StyleExtractionError(f"Unexpected content type from WMS GetStyles: {content_type}")
 
     except httpx.HTTPStatusError as e:
         raise StyleExtractionError(
@@ -535,27 +544,20 @@ def _fetch_wms_legend(url: str, timeout: float = 30.0) -> bytes | None:
     try:
         _reject_credential_bearing_http_url(url)
 
-        with httpx.Client(
-            timeout=timeout,
-            follow_redirects=True,
-            event_hooks={"request": [_credential_redirect_guard(url)]},
-        ) as client:
-            response = client.get(url)
-            response.raise_for_status()
+        response = _guarded_get(url, timeout)
+        content_type = response.headers.get("content-type", "")
 
-            content_type = response.headers.get("content-type", "")
+        # Check for image/png response
+        if "image/png" in content_type:
+            return response.content
 
-            # Check for image/png response
-            if "image/png" in content_type:
-                return response.content
+        # Some servers return image without proper content-type
+        # Check for PNG magic bytes
+        if response.content.startswith(b"\x89PNG"):
+            return response.content
 
-            # Some servers return image without proper content-type
-            # Check for PNG magic bytes
-            if response.content.startswith(b"\x89PNG"):
-                return response.content
-
-            logger.warning("Unexpected content type from WMS GetLegendGraphic: %s", content_type)
-            return None
+        logger.warning("Unexpected content type from WMS GetLegendGraphic: %s", content_type)
+        return None
 
     except httpx.HTTPStatusError as e:
         logger.warning("WMS GetLegendGraphic request failed: HTTP %s", e.response.status_code)
