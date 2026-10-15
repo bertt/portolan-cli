@@ -22,9 +22,15 @@ Which passes run by default, and why:
   agent working a check → fix → re-check loop that second copy is pure noise.
   ``--schema`` turns it on, which is worth doing when validating a catalog some
   other tool produced.
-- **live** (HTTP Range and CORS against the published host) — off, it reaches
-  the network. ``--live`` opts in; when the catalog is published and ``--live``
-  was not passed, the outcome carries a :class:`LiveHint` saying so.
+- **extensions** (the schema of each STAC extension an object declares) — on,
+  as rashid 0.2.0 defaults it. rashid ships the schemas of the versions the
+  profile registry pins, so those validate offline. A declared version the
+  registry does not pin is fetched over https. An unreachable schema degrades
+  to a ``PTL-EXT-000`` warning.
+- **live** (HTTP Range, CORS, and link targets against the published host) —
+  off, it reaches the network. ``--live`` opts in; when the catalog is published
+  and ``--live`` was not passed, the outcome carries a :class:`LiveHint` saying
+  so. ``PTL-LIV-006`` reports a linked file the host does not serve.
 """
 
 from __future__ import annotations
@@ -32,14 +38,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rashid import validate
 from rashid.data.reader import LocalOnlyReader
-from rashid.model import Report
 
 from portolan_cli.validation.config import load_public_url, load_rules_config
 from portolan_cli.validation.legacy import detect_legacy_notes
+
+if TYPE_CHECKING:
+    from rashid.model import Report
 
 #: A structural/schema validator maps one object's raw JSON to schema errors.
 #: Injected by tests to keep them offline and independent of schema churn.
@@ -118,7 +126,8 @@ def _live_hint(root: Path, public_url: str | None, *, live: bool) -> LiveHint | 
         base_url=base_url,
         message=(
             f"This catalog is published at {base_url}. Run `portolan check --live` to verify the "
-            "host serves the assets with HTTP Range support and CORS headers."
+            "host serves the assets with HTTP Range support and CORS headers, and serves every "
+            "linked file."
         ),
     )
 

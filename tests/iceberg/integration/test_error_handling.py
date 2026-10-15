@@ -1,6 +1,6 @@
 """Integration tests for error handling in the CLI-to-Iceberg pipeline."""
 
-from unittest.mock import patch
+from __future__ import annotations
 
 import pytest
 
@@ -34,18 +34,17 @@ def test_rollback_nonexistent_version_exits_error(initialized_iceberg_catalog, r
     assert result.exit_code == 0
 
     # Try to rollback to nonexistent version
-    with patch("portolan_cli.backends.iceberg.config._get_external_config", return_value=None):
-        result = runner.invoke(
-            cli,
-            [
-                "version",
-                "rollback",
-                "rollback_err",
-                "99.0.0",
-                "--catalog",
-                str(catalog_root),
-            ],
-        )
+    result = runner.invoke(
+        cli,
+        [
+            "version",
+            "rollback",
+            "rollback_err",
+            "99.0.0",
+            "--catalog",
+            str(catalog_root),
+        ],
+    )
     assert result.exit_code != 0, f"Expected error, got: {result.output}"
 
 

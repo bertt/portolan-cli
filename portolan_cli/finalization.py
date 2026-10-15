@@ -25,18 +25,17 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path, PurePath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pystac
 from pystac.layout import AsIsLayoutStrategy
 
 from portolan_cli.config import load_merged_metadata, load_own_metadata
-from portolan_cli.formats import FormatType
+from portolan_cli.hookspecs import EnrichContext
 from portolan_cli.humanize import humanize_slug
 from portolan_cli.json_io import write_json_atomic
 from portolan_cli.metadata import extract_geoparquet_metadata
 from portolan_cli.metadata.geoparquet import GeoParquetMetadata
-from portolan_cli.preparation import PreparedItem
 from portolan_cli.query import ItemInfo
 from portolan_cli.stac import (
     DEFAULT_LICENSE,
@@ -57,6 +56,8 @@ from portolan_cli.stac import (
     update_catalog_provenance,
     update_collection_summaries,
 )
+from portolan_cli.stac_enrich import enrich_collection_file, enrich_item_file
+from portolan_cli.stac_links import iter_links
 from portolan_cli.utils import href_root, relative_href
 from portolan_cli.versions import (
     Asset,
@@ -66,6 +67,10 @@ from portolan_cli.versions import (
     read_versions,
     write_versions,
 )
+
+if TYPE_CHECKING:
+    from portolan_cli.plugins.formats import FormatContext
+    from portolan_cli.preparation import PreparedItem
 
 logger = logging.getLogger(__name__)
 
@@ -209,13 +214,8 @@ def _fix_item_links(
         return
 
     collection_data = json.loads(collection_json_path.read_text(encoding="utf-8"))
-    for link in collection_data.get("links", []):
-        if link.get("rel") != "item":
-            continue
-        href = link.get("href", "")
-        if not href:
-            continue
-        item_path = (collection_dir / href).resolve()
+    for _link, _href, linked_path in iter_links(collection_data, collection_dir, ("item",)):
+        item_path = linked_path.resolve()
         if not item_path.exists():
             continue
 
@@ -553,7 +553,7 @@ def _collect_parquet_metadata_from_disk(
         # but STAC asset hrefs always use forward slashes)
         relative_path = parquet_file.relative_to(collection_dir).as_posix()
         if relative_path not in tracked_hrefs:
-            logger.debug(f"Skipping untracked parquet file: {relative_path}")
+            logger.debug("Skipping untracked parquet file: %s", relative_path)
             continue
 
         try:
@@ -561,7 +561,7 @@ def _collect_parquet_metadata_from_disk(
             metadata_list.append(meta)
         except Exception as e:
             # Log but don't fail - file might be corrupted or not a valid parquet
-            logger.warning(f"Could not read metadata from {parquet_file}: {e}")
+            logger.warning("Could not read metadata from %s: %s", parquet_file, e)
 
     return metadata_list
 
@@ -650,7 +650,7 @@ def _ensure_partition_metadata(
         partition_columns = [k["name"] for k in partition_keys]
         file_count = detected.get("partition:file_count", 0)
 
-        logger.debug(f"Auto-detected Hive partitions in {collection_dir}: {partition_columns}")
+        logger.debug("Auto-detected Hive partitions in %s: %s", collection_dir, partition_columns)
 
         # Create glob asset for bulk access (Issue #443)
         # Only add if not already present (avoid duplicates on re-add)
@@ -674,8 +674,8 @@ def _ensure_partition_metadata(
                 # Key is occupied by non-glob asset - use alternate key
                 glob_asset_key = "partitioned_data_glob"
                 logger.debug(
-                    f"Key 'partitioned_data' occupied by non-glob asset, "
-                    f"using '{glob_asset_key}' instead"
+                    "Key 'partitioned_data' occupied by non-glob asset, using '%s' instead",
+                    glob_asset_key,
                 )
 
             glob_asset = pystac.Asset(
@@ -686,7 +686,7 @@ def _ensure_partition_metadata(
                 description=f"Glob pattern for {file_count} partitioned files",
             )
             collection.assets[glob_asset_key] = glob_asset
-            logger.debug(f"Added glob asset with pattern: {glob_pattern}")
+            logger.debug("Added glob asset with pattern: %s", glob_pattern)
 
         # Validate schema consistency for auto-detected partitions
         validation = validate_partition_schemas(collection_dir)
@@ -856,10 +856,7 @@ def _finalize_with_backend(
     assets: dict[str, str] = {}
     for p in items:
         for filename, (file_path, _checksum, _size) in p.asset_files.items():
-            if p.is_collection_level_asset:
-                asset_key = filename
-            else:
-                asset_key = f"{p.item_id}/{filename}"
+            asset_key = filename if p.is_collection_level_asset else f"{p.item_id}/{filename}"
             assets[asset_key] = str(file_path)
     publish_version(collection_id, assets=assets, catalog_root=catalog_root)
 
@@ -1012,34 +1009,61 @@ def _emit_stale_asset_warnings(
         logger.debug(warning_msg)
 
 
-def _apply_table_extension_from_disk(
+def _describe_collection(
     collection: pystac.Collection,
+    catalog_root: Path,
     collection_dir: Path,
     items: list[PreparedItem],
     merge_strategy: MergeStrategy,
 ) -> None:
+    """Let each format handler in this batch add its collection fields (#947).
+
+    The GeoParquet handler aggregates the table extension, for example.
+
+    Args:
+        collection: The collection in memory.
+        catalog_root: Catalog root.
+        collection_dir: Directory holding collection.json.
+        items: Prepared items of this batch.
+        merge_strategy: How to merge detected values into existing ones.
+    """
+    from portolan_cli.plugins.formats import FormatContext, handler_named
+
+    by_handler: dict[str, list[Any]] = {}
+    for prepared in items:
+        if prepared.format_name and prepared.metadata is not None:
+            by_handler.setdefault(prepared.format_name, []).append(prepared.metadata)
+    context = FormatContext(
+        catalog_root=catalog_root, collection_dir=collection_dir, merge_strategy=merge_strategy
+    )
+    for name, metadata in by_handler.items():
+        handler = handler_named(name)
+        if handler is not None:
+            handler.describe_collection(collection, metadata, context)
+
+
+def aggregate_table_extension(
+    collection: pystac.Collection, metadata: list[Any], context: FormatContext
+) -> None:
     """Aggregate table:* metadata from tracked parquet on disk (issues #304/#447).
 
-    Only runs when the batch contains at least one NEW GeoParquet item.
+    Runs only when the batch holds at least one NEW GeoParquet file.
     Recomputes aggregates from ALL tracked parquet files on disk instead of
-    carrying forward stale counts — preventing double-counting on re-add and
-    stale counts when files are replaced. PMTiles/FlatGeobuf are collection-level
-    assets without table schema and are excluded.
-    """
-    new_geoparquet_metadata: list[GeoParquetMetadata] = [
-        p.metadata
-        for p in items
-        if p.format_type == FormatType.VECTOR and isinstance(p.metadata, GeoParquetMetadata)
-    ]
-    if not new_geoparquet_metadata:
-        return
+    carrying forward stale counts. This prevents double-counting on re-add and
+    stale counts when files are replaced. The built-in GeoParquet handler
+    calls this from ``describe_collection``.
 
-    # Recompute from disk: scan tracked parquet assets in collection
-    # This is O(n) file metadata reads but always correct
-    all_parquet_metadata = _collect_parquet_metadata_from_disk(collection_dir, collection)
+    Args:
+        collection: The collection in memory.
+        metadata: What the handler read from each new file.
+        context: Where the collection sits, and the merge strategy.
+    """
+    if not any(isinstance(m, GeoParquetMetadata) for m in metadata):
+        return
+    all_parquet_metadata = _collect_parquet_metadata_from_disk(context.collection_dir, collection)
     if all_parquet_metadata:
         aggregated = aggregate_table_metadata(all_parquet_metadata)
-        add_table_extension(collection, aggregated, merge_strategy=merge_strategy)
+        add_table_extension(collection, aggregated, merge_strategy=context.merge_strategy)
 
 
 def _emit_partition_warnings(
@@ -1056,6 +1080,46 @@ def _emit_partition_warnings(
 
     for warning_msg in partition_warnings:
         warn_output(warning_msg)
+
+
+def _enrich_saved_documents(
+    catalog_root: Path,
+    collection_id: str,
+    collection_dir: Path,
+    items: list[PreparedItem],
+) -> None:
+    """Run the item hook on each prepared item file, then the collection hook.
+
+    A collection-level asset has no item file, so only the collection hook
+    sees it.
+
+    Args:
+        catalog_root: Root directory of the catalog.
+        collection_id: Collection identifier (may be nested).
+        collection_dir: Directory holding collection.json.
+        items: Prepared items of this collection.
+    """
+    for prepared in items:
+        item_path = prepared.item_json_path
+        if item_path is not None and item_path.exists():
+            enrich_item_file(
+                item_path,
+                EnrichContext(
+                    catalog_root=catalog_root,
+                    collection_id=collection_id,
+                    document_path=item_path,
+                    item_id=prepared.item_id,
+                ),
+            )
+    collection_path = collection_dir / "collection.json"
+    enrich_collection_file(
+        collection_path,
+        EnrichContext(
+            catalog_root=catalog_root,
+            collection_id=collection_id,
+            document_path=collection_path,
+        ),
+    )
 
 
 def _finalize_collection(
@@ -1101,7 +1165,7 @@ def _finalize_collection(
     _emit_stale_asset_warnings(collection, collection_dir)
 
     # Add table extension if any items are GeoParquet format (Issue #304/#447)
-    _apply_table_extension_from_disk(collection, collection_dir, items, merge_strategy)
+    _describe_collection(collection, catalog_root, collection_dir, items, merge_strategy)
 
     # Add partition extension if any items have partition metadata (Issue #232/#443)
     _emit_partition_warnings(collection, collection_dir, items)
@@ -1125,6 +1189,10 @@ def _finalize_collection(
     # Save collection.json ONCE for all items in this collection
     _save_collection_with_links(collection, collection_dir, catalog_root, collection_id)
 
+    # Run the enrichment hooks on the saved files. A backend may upload the
+    # STAC JSON when it publishes, so the hooks run first (#947).
+    _enrich_saved_documents(catalog_root, collection_id, collection_dir, items)
+
     # Route version snapshot to the active backend (plugin or file)
     _publish_collection_version(catalog_root, collection_id, collection_dir, collection, items)
 
@@ -1135,7 +1203,7 @@ def _finalize_collection(
             collection_id=p.collection_id,
             format_type=p.format_type,
             bbox=p.bbox,
-            asset_paths=[str(path) for _name, (path, _checksum, _size) in p.asset_files.items()],
+            asset_paths=[str(path) for (path, _checksum, _size) in p.asset_files.values()],
         )
         for p in items
     ]

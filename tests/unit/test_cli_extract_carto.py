@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from click.testing import CliRunner
 
 from portolan_cli.cli import cli
-from portolan_cli.extract.carto.orchestrator import (
-    ExtractionOptions,
-    _build_dry_run_report,
-)
-from portolan_cli.extract.common.report import ExtractionReport
+from portolan_cli.extract.common.source import Discovery, build_report
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from portolan_cli.extract.carto.orchestrator import ExtractionOptions
+    from portolan_cli.extract.common.report import ExtractionReport
 
 pytestmark = [pytest.mark.unit]
 
@@ -38,7 +40,7 @@ def _make_capturing_fake(captured: dict[str, object]) -> Callable[..., Extractio
         captured["catalog_id"] = options.catalog_id
         captured["layer_filter"] = layer_filter
         captured["layer_exclude"] = layer_exclude
-        return _build_dry_run_report(url, [])
+        return build_report(Discovery(source_url=url, layers=[]), [])
 
     return fake_extract
 

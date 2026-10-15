@@ -6,6 +6,15 @@ data in Iceberg tables and version metadata in snapshot summary properties.
 
 from __future__ import annotations
 
+import sys
+
+if sys.version_info[:2] < (3, 11):
+    raise ImportError(
+        "The Iceberg backend requires Python 3.11+. "
+        f"You are running Python {sys.version_info[0]}.{sys.version_info[1]}."
+    )
+
+import contextlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +24,14 @@ from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.table import Transaction
 from pyiceberg.table.update.snapshot import ExpireSnapshots
 
+from portolan_cli.api import (
+    Asset,
+    DriftReport,
+    SchemaFingerprint,
+    SchemaInfo,
+    Version,
+    write_json_atomic,
+)
 from portolan_cli.backends.iceberg.config import create_catalog
 from portolan_cli.backends.iceberg.spatial import add_spatial_columns, detect_geohash_precision
 from portolan_cli.backends.iceberg.versioning import (
@@ -23,15 +40,51 @@ from portolan_cli.backends.iceberg.versioning import (
     snapshot_to_version,
     version_to_snapshot_properties,
 )
-from portolan_cli.backends.protocol import DriftReport, SchemaFingerprint
-from portolan_cli.utils import href_root
-from portolan_cli.versions import Asset, SchemaInfo, Version
 
 if TYPE_CHECKING:
     from pyiceberg.catalog import Catalog
     from pyiceberg.table import Table
 
 NAMESPACE = "portolake"
+
+
+def _merge_into_collection_json(
+    path: Path,
+    fields: dict[str, Any],
+    extensions: tuple[str, ...],
+    assets: dict[str, dict[str, Any]],
+) -> None:
+    """Merge the Iceberg fields, extensions, and assets into ``collection.json``.
+
+    The merge keeps every other field in the file.
+
+    Args:
+        path: The collection.json file.
+        fields: ``table:*`` and ``iceberg:*`` fields. They replace earlier values.
+        extensions: Extension schema URLs to add when absent.
+        assets: Asset dicts by key. They replace an asset with the same key.
+    """
+    import json
+
+    document: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    document.update(fields)
+    declared = document.setdefault("stac_extensions", [])
+    declared.extend(url for url in extensions if url not in declared)
+    if assets:
+        document.setdefault("assets", {}).update(assets)
+    write_json_atomic(path, document)
+
+
+def _is_fetchable(href: str) -> bool:
+    """Can a reader retrieve this href over the web?
+
+    rashid's PTL-AST-002 accepts a relative href or https, so an s3:// or gs://
+    location fails the same rule a published catalog has to meet.
+    """
+    from urllib.parse import urlparse
+
+    scheme = urlparse(href).scheme
+    return scheme in ("", "https")
 
 
 class IcebergBackend:
@@ -46,10 +99,10 @@ class IcebergBackend:
 
     def __init__(self, catalog: Catalog | None = None, catalog_root: Path | None = None) -> None:
         self._catalog: Catalog = catalog if catalog is not None else create_catalog(catalog_root)
-        try:
+        # Namespace creation is idempotent. An existing namespace is the
+        # expected case on every run after the first.
+        with contextlib.suppress(Exception):
             self._catalog.create_namespace(NAMESPACE)
-        except Exception:  # nosec B110 - namespace may already exist, idempotent init
-            pass
 
     def _validate_collection(self, collection: str) -> str:
         """Validate and sanitize collection name."""
@@ -127,10 +180,11 @@ class IcebergBackend:
             table = self._catalog.load_table(table_id)
         except NoSuchTableError:
             return []
-        versions = []
-        for snap in table.snapshots():
-            if snap.summary and "portolake.version" in snap.summary.additional_properties:
-                versions.append(snapshot_to_version(snap))
+        versions = [
+            snapshot_to_version(snap)
+            for snap in table.snapshots()
+            if snap.summary and "portolake.version" in snap.summary.additional_properties
+        ]
         return sorted(versions, key=lambda v: v.created)
 
     def publish(
@@ -272,10 +326,11 @@ class IcebergBackend:
         except NoSuchTableError:
             return []
 
-        versioned_snapshots = []
-        for snap in table.snapshots():
-            if snap.summary and "portolake.version" in snap.summary.additional_properties:
-                versioned_snapshots.append(snap)
+        versioned_snapshots = [
+            snap
+            for snap in table.snapshots()
+            if snap.summary and "portolake.version" in snap.summary.additional_properties
+        ]
         versioned_snapshots.sort(key=lambda s: s.timestamp_ms)
 
         if len(versioned_snapshots) <= keep:
@@ -364,20 +419,45 @@ class IcebergBackend:
                 if ext_url not in collection.stac_extensions:
                     collection.stac_extensions.append(ext_url)
 
-            # Set Iceberg data asset via pystac API (not extra_fields["assets"],
-            # which is also ignored by pystac's serialization).
-            collection.assets["data"] = pystac.Asset(
-                href=table.location(),
-                media_type="application/x-iceberg",
-                roles=["data"],
-                description=(
-                    "Apache Iceberg table \u2014 use PyIceberg, DuckDB "
-                    "iceberg_scan(), or Spark to query"
-                ),
-            )
+            # The table's current metadata.json, under its own key (issue #883).
+            # The spec asks only that a reader open the table from this file
+            # without a catalog service, which a warehouse on object storage
+            # satisfies whether or not a server also manages the table.
+            #
+            # The role is "metadata" alone, because the GeoParquet file keeps
+            # the data role. Earlier revisions assigned assets["data"] to
+            # table.location(), which is a directory and so resolves to no
+            # document. A generated catalog keys its GeoParquet asset by
+            # filename, so that assignment added a second asset carrying the
+            # same "data" role; a collection that does use the "data" key lost
+            # it. assets["data"] is not touched here.
+            # PTL-AST-002 allows a relative href or https. The extension says
+            # to add the asset only when the metadata.json is a document a
+            # reader can fetch, so a warehouse the catalog does not publish
+            # over the web carries the connection fields alone.
+            metadata_location = stac_metadata.get("iceberg:metadata_location")
+            new_assets: dict[str, pystac.Asset] = {}
+            if metadata_location and _is_fetchable(str(metadata_location)):
+                new_assets["iceberg"] = pystac.Asset(
+                    href=str(metadata_location),
+                    media_type="application/vnd.apache.iceberg+json",
+                    roles=["metadata"],
+                    description=(
+                        "Apache Iceberg table metadata \u2014 read with DuckDB "
+                        "iceberg_scan() or PyIceberg StaticTable"
+                    ),
+                )
+            collection.assets.update(new_assets)
 
-            collection.normalize_hrefs(href_root(collection_dir))
-            collection.save(catalog_type=pystac.CatalogType.SELF_CONTAINED)
+            # Merge into the file on disk. The enrichment hooks already wrote
+            # plugin fields there, and the in-memory collection does not hold
+            # them. A pystac save would drop them (#947).
+            _merge_into_collection_json(
+                Path(collection_dir) / "collection.json",
+                fields=stac_metadata,
+                extensions=(STAC_TABLE_EXTENSION, STAC_ICEBERG_EXTENSION),
+                assets={key: asset.to_dict() for key, asset in new_assets.items()},
+            )
         except Exception:
             logger.warning(
                 "Could not update STAC extensions for collection %s",
@@ -412,7 +492,7 @@ class IcebergBackend:
         Only uploads STAC metadata (item JSON, collection JSON, catalog.json).
         Data files are NOT uploaded — they live in the Iceberg warehouse.
         """
-        from portolan_cli.sync.upload import upload_file
+        from portolan_cli.api import upload_file
 
         remote = remote.rstrip("/")
 
@@ -445,9 +525,7 @@ class IcebergBackend:
         Queries get_current_version() for asset info, then downloads each
         asset from {remote_url}/{href} to {local_root}/{href}.
         """
-        from portolan_cli.output import detail, error, info, success
-        from portolan_cli.sync.download import download_file
-        from portolan_cli.sync.pull import PullResult
+        from portolan_cli.api import PullResult, detail, download_file, error, info, success
 
         remote_url = remote_url.rstrip("/")
 
@@ -479,7 +557,7 @@ class IcebergBackend:
 
         downloaded = 0
         failed = 0
-        for _asset_key, asset in version.assets.items():
+        for asset in version.assets.values():
             source = f"{remote_url}/{asset.href}"
             dest = local_root / Path(asset.href)
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -532,18 +610,14 @@ def _read_parquet_assets(assets: dict[str, str]) -> pa.Table | None:
     for path_str in assets.values():
         path = Path(path_str)
         if path.exists() and path.suffix == ".parquet":
-            try:
+            # Skip an invalid or unreadable Parquet file.
+            with contextlib.suppress(Exception):
                 tables.append(pq.read_table(path))
-            except Exception:  # nosec B110 - skip invalid/unreadable parquet files
-                pass
 
     if not tables:
         return None
 
-    if len(tables) == 1:
-        result = tables[0]
-    else:
-        result = pa.concat_tables(tables, promote_options="default")
+    result = tables[0] if len(tables) == 1 else pa.concat_tables(tables, promote_options="default")
 
     # Add spatial columns (geohash + bbox) if geometry is present
     return add_spatial_columns(result)

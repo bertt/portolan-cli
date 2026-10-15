@@ -41,7 +41,7 @@ class TestHrefRoot:
         working_dir.mkdir()
         monkeypatch.chdir(working_dir)
 
-        assert href_root(Path(".")) == f"{working_dir.resolve()}/"
+        assert href_root(Path()) == f"{working_dir.resolve()}/"
 
     @pytest.mark.unit
     def test_preserves_a_dotted_final_component(self, tmp_path: Path) -> None:
@@ -95,4 +95,4 @@ class TestEveryCallSiteUsesTheHelper:
             if re.search(r"\.normalize_hrefs\(", line)
         ]
 
-        assert len(call_sites) == 4, f"expected 4 normalize_hrefs call sites, found {call_sites}"
+        assert len(call_sites) == 3, f"expected 3 normalize_hrefs call sites, found {call_sites}"

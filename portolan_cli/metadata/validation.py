@@ -17,6 +17,7 @@ from portolan_cli.metadata.models import MetadataCheckResult, MetadataReport, Me
 from portolan_cli.models.catalog import CatalogModel
 from portolan_cli.models.collection import CollectionModel
 from portolan_cli.models.item import ItemModel
+from portolan_cli.stac_links import resolve_href
 
 
 @dataclass
@@ -151,8 +152,7 @@ def validate_catalog_links(
         elif link.rel == "root":
             has_root = True
         elif link.rel in ("child", "item"):
-            # Resolve relative path
-            target_path = (catalog_dir / link.href).resolve()
+            target_path = resolve_href(catalog_dir, link.href).resolve()
 
             if not target_path.exists():
                 result.passed = False
@@ -234,7 +234,7 @@ def _check_catalog(catalog_path: Path) -> MetadataCheckResult | None:
         MetadataCheckResult or None if not a valid catalog.
     """
     try:
-        with open(catalog_path, encoding="utf-8") as f:
+        with Path(catalog_path).open(encoding="utf-8") as f:
             data = json.load(f)
 
         if data.get("type") != "Catalog":
@@ -249,13 +249,12 @@ def _check_catalog(catalog_path: Path) -> MetadataCheckResult | None:
                 status=MetadataStatus.FRESH,
                 message="Catalog metadata is valid",
             )
-        else:
-            return MetadataCheckResult(
-                file_path=catalog_path,
-                status=MetadataStatus.STALE,
-                message=validation.errors[0].message if validation.errors else "Catalog has issues",
-                fix_hint="Run 'portolan fix' to repair catalog links",
-            )
+        return MetadataCheckResult(
+            file_path=catalog_path,
+            status=MetadataStatus.STALE,
+            message=validation.errors[0].message if validation.errors else "Catalog has issues",
+            fix_hint="Run 'portolan fix' to repair catalog links",
+        )
 
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         return MetadataCheckResult(
@@ -276,7 +275,7 @@ def _check_collection(collection_path: Path) -> MetadataCheckResult | None:
         MetadataCheckResult or None if not a valid collection.
     """
     try:
-        with open(collection_path, encoding="utf-8") as f:
+        with Path(collection_path).open(encoding="utf-8") as f:
             data = json.load(f)
 
         if data.get("type") != "Collection":
@@ -310,7 +309,7 @@ def _check_item_json(json_path: Path) -> MetadataCheckResult | None:
         MetadataCheckResult or None if not a STAC item.
     """
     try:
-        with open(json_path, encoding="utf-8") as f:
+        with Path(json_path).open(encoding="utf-8") as f:
             data = json.load(f)
 
         if data.get("type") != "Feature":

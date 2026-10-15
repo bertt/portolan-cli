@@ -33,8 +33,7 @@ Install with: `uv tool install prek && prek install`
 - `mypy` — Type checking (strict)
 - `import-linter` — Architecture contracts
 - `codespell` — Spell checking
-- `vulture` / `xenon` / `pylint` — Dead code, complexity, duplicate code (R0801)
-- `bandit` — Static security analysis
+- `vulture` / `jscpd` — Dead code, duplicate code (baseline-gated)
 - `deptry` — Dependency hygiene
 - `actionlint` / `zizmor` — GitHub Actions workflow linting + supply-chain audit
 - `validate-agents-md` — AGENTS.md reference validation
@@ -59,8 +58,7 @@ Workflow: `.github/workflows/ci.yml`
 
 Runs `prek run --all-files` — the *same* hooks developers run locally (see Tier 1),
 so CI and local hooks can't drift. Covers ruff, mypy, import-linter, codespell,
-vulture, xenon, pylint-duplicate, bandit, deptry, actionlint, zizmor, and
-the builtin file hooks. Replaces the old separate `lint` and `dead-code` jobs.
+vulture, jscpd, deptry, actionlint, zizmor, and the builtin file hooks. Replaces the old separate `lint` and `dead-code` jobs.
 
 CI skips three hooks: `no-commit-to-branch` (fails on push-to-main), `fast-tests`
 (the `test` job covers them), and `update-freshness` (stamps today's date, so it's
@@ -72,7 +70,8 @@ non-deterministic in CI — drift is still caught by the non-mutating
 - `pip-audit` — dependency vulnerability scanning. Ignores come from the
   single-source `.pip-audit-ignores` file (each entry has an expiry + reason;
   expired entries drop automatically). The same file feeds `nightly.yml` and
-  `security-audit.yml`. (`bandit` moved into the `quality` job.)
+  `security-audit.yml`. Ruff's `S` rules check our own code in the `quality`
+  job.
 
 #### `test` — Test Matrix
 
@@ -99,11 +98,25 @@ non-deterministic in CI — drift is still caught by the non-mutating
 
 #### `docs` — Documentation Build
 
-- `mkdocs build --strict` — Fails on warnings
+- `zensical build --strict --clean` — Builds the site. Fails on a warning, a
+  dead link, or a dead anchor.
+- `pytest tests/docs/` — Verifies the built site. `--strict` does not report a
+  dropped plugin or an empty snippet include.
 
 #### `build` — Package Build
 
 - `uv build` — Verify package builds correctly
+
+#### `plugin-test` — the example plugin
+
+- Installs `tests/plugins/portolan_example` into the project environment
+  with `uv pip install`, then runs `uv run --no-sync pytest tests/plugins -m plugin`
+- Cells: Ubuntu with Python 3.10, Windows with Python 3.13
+- The example plugin imports only `portolan_cli.api`,
+  `portolan_cli.hookspecs`, and `portolan_cli.testing`. A change to those
+  modules that breaks a plugin fails this job (#947)
+- The main `test` job collects the same files and skips them, because the
+  plugin is not installed there
 
 #### `iceberg-test` — Iceberg Unit & Integration Tests
 
@@ -117,7 +130,7 @@ non-deterministic in CI — drift is still caught by the non-mutating
 
 - Python versions: 3.11, 3.12, 3.13 (Ubuntu only — Docker on Linux)
 - Runs only when iceberg-related paths change (or on push to `main`)
-- Spins up `docker-compose` (REST Iceberg catalog + MinIO), runs `-m "e2e and not e2e_slow"` with a 120s per-test timeout
+- Spins up `docker-compose` (REST Iceberg catalog + RustFS, an S3-compatible server), runs `-m "e2e and not e2e_slow"` with a 120s per-test timeout
 - Dumps Docker logs on failure and always tears down
 
 ---
@@ -212,7 +225,7 @@ Why this matters: AI-generated tests can be tautological — they may pass but n
 #### `iceberg-e2e-full` — Iceberg E2E Tests (full suite)
 
 - Python 3.11 on Ubuntu
-- Spins up `docker-compose` (REST Iceberg catalog + MinIO), runs `-m e2e` (includes `e2e_slow`: concurrency stress and large datasets)
+- Spins up `docker-compose` (REST Iceberg catalog + RustFS, an S3-compatible server), runs `-m e2e` (includes `e2e_slow`: concurrency stress and large datasets)
 - 120s per-test timeout; Docker logs on failure; always tears down
 
 ---
@@ -287,9 +300,10 @@ markers = [
     "network: Requires network access (mocked locally, real in CI)",
     "realdata: Uses real-world fixtures from tests/fixtures/realdata/ (tests orchestration, not geometry)",
     "snapshot: Compares output against golden files",
+    "plugin: Needs the example plugin installed (tests/plugins/portolan_example)",
     "benchmark: Performance measurement, tracked over time",
     "slow: Takes > 5 seconds",
-    "e2e: End-to-end tests requiring Docker (REST catalog + MinIO)",
+    "e2e: End-to-end tests requiring Docker (REST catalog + RustFS)",
     "e2e_slow: Extended E2E tests (concurrency stress, large datasets) — nightly only",
 ]
 ```
@@ -299,7 +313,7 @@ markers = [
 | Gate | Tests |
 |------|-------|
 | Pre-commit | unit only (fast, < 30s total) |
-| CI (PR) | unit, integration, snapshot, **realdata**; iceberg `e2e` (not `e2e_slow`) when iceberg paths change |
+| CI (PR) | unit, integration, snapshot, **realdata**; `plugin` in the `plugin-test` job; iceberg `e2e` (not `e2e_slow`) when iceberg paths change |
 | Nightly | All markers including network, benchmark, and the full iceberg `e2e` suite (with `e2e_slow`) |
 
 ### Real-World Fixtures
@@ -314,22 +328,18 @@ See `context/shared/documentation/test-fixtures.md` for details.
 
 ## Complexity Thresholds
 
-Using `xenon` (based on radon cyclomatic complexity):
+Ruff owns complexity through the `C901` rule (mccabe). The ceiling is
+`max-complexity = 15` in `[tool.ruff.lint.mccabe]`. The rule counts the decision
+points in one function. A nested function adds its own count to the function
+that holds it.
 
-| Level | Score | Meaning |
-|-------|-------|---------|
-| A | 1-5 | Simple, low risk |
-| B | 6-10 | Slightly complex |
-| C | 11-20 | Moderately complex |
-| D | 21-30 | Complex, high risk |
-| E | 31-40 | Untestable, very high risk |
-| F | 41+ | Error-prone, extremely high risk |
+The gate is per function. It has no module average and no repo average, because
+one complex function cannot move an average. Split the function when `C901`
+reports it. Extract the reporting code first, then the loop body.
 
-**Current thresholds:**
-
-- `--max-absolute=C` — No function exceeds C
-- `--max-modules=B` — No module average exceeds B
-- `--max-average=A` — Codebase average must be A
+`xenon` and `radon` ran this gate before. Ruff replaced them in September 2026.
+The `S` rules also replaced `bandit`. One tool now walks the source
+tree once.
 
 ---
 

@@ -29,9 +29,9 @@ dependencies = [
     "antimeridian>=0.3.11", # RFC 7946 compliant antimeridian handling for STAC bbox
     "click>=8.4,<8.6", # PYSEC-2026-2132 fix; 8.4 makes ParamType generic (temporal.FlexibleDateTime subscripts it)
     "defusedxml>=0.7.1", # Safe XML parsing (XXE protection) for CSW/ISO 19139 metadata
-    "duckdb>=1.5.2,<1.5.6", # 1.5.5 segfaults in ST_Read_Meta on malformed input; see known-issues
+    "duckdb>=1.5.6,<1.5.7", # Floor skips 1.5.5, which segfaults in ST_Read_Meta on malformed input; see known-issues
     "geopandas>=0.14.0", # Reads GeoParquet for the thumbnail floor, which every collection needs (Issue #683)
-    "geoparquet-io>=1.4.0", # Table API keeps the source CRS on write (gpio#625, Issue #810)
+    "geoparquet-io>=1.6.0", # One write facade keeps CRS, native geometry and bbox covering on every write path (gpio#990, #1009)
     "httpx>=0.27.0", # HTTP client for ArcGIS REST API discovery
     "matplotlib>=3.8.0", # Renders the deterministic thumbnail floor. Core, not optional: PTL-VIZ-001 is an ERROR, so a default install must be able to produce a conformant catalog (#518 Track 1, #683)
     "obstore>=0.8.2", # Cloud object storage (S3, GCS, Azure) via Rust bindings
@@ -47,17 +47,25 @@ dependencies = [
     "lxml>=6.1.0", # CVE-2026-41066 fix (transitive via owslib, pinned for security)
     "pillow>=12.3.0", # PYSEC-2026-2253..2257 fix (transitive via rasterio, pinned for security)
     "pmtiles>=3.0.0", # PMTiles metadata reading (header, bounds, zoom levels)
+    "pluggy>=1.5.0", # Plugin hooks (#947). Pure Python, no dependencies. 1.5 adds warn_on_impl_args for hook deprecation
     "pyogrio>=0.7.0", # FlatGeobuf metadata reading (transitive via geoparquet-io, but we import directly)
     "pygments>=2.20.0", # CVE-2026-4539 fix (transitive via rich, pinned for security)
     "requests>=2.33.0", # CVE-2026-25645 fix (transitive, pinned for security)
     "rich>=13.0.0", # Terminal progress bars (transitive via geoparquet-io, but we import directly)
     "rio-cogeo>=5.0.0", # COG creation/validation (includes rasterio)
-    "rashid>=0.1.5,<0.2.0", # Conformance validator behind `portolan check`; ships its own STAC + Portolan profile schemas, so validation runs offline. 0.1.5 is the floor for the catalog-logo rules PTL-LNK-007/008/009 (PORTO-CORE-074..077) and for PTL-AST-006, whose absence in 0.1.4 let a wrong COG media type mask PTL-COL-004 and PTL-MIR-001. The conformance gate asserts all four, so this is a hard floor, not a preference
+    "rashid>=0.2.0,<0.3.0", # Conformance validator behind `portolan check`; ships its own STAC + Portolan profile schemas, so validation runs offline. 0.2.0 is the floor for PTL-LIV-006, which `check --live` uses to report a linked file the publish host does not serve (issue #935). Earlier floors: 0.1.5 added the catalog-logo rules PTL-LNK-007/008/009 (PORTO-CORE-074..077) and PTL-AST-006, whose absence in 0.1.4 let a wrong COG media type mask PTL-COL-004 and PTL-MIR-001. The conformance gate asserts all four, so this is a hard floor, not a preference
     "typing_extensions>=4.0.0; python_version < '3.11'",
+    "lerc>=4.0.1", # Decodes the LERC tiles that hosted tiled imagery layers cache. GDAL 3.12 fails on LERC2 version 6 with "MRF: Error decoding Lerc", so `extract arcgis` cannot read a TilesOnly ImageServer without it (Issue #870). The wheel ships binaries for Windows x64, macOS, and Linux x86-64, so tilecache.py imports it lazily and explains the failure on other platforms
 ]
 
 [project.scripts]
 portolan = "portolan_cli:cli"
+
+# Built-in commands that use the plugin path (#947). An entry point that
+# portolan-cli declares always loads, whatever PORTOLAN_PLUGINS says.
+[project.entry-points."portolan.commands"]
+"version.rollback" = "portolan_cli.backends.iceberg.cli:rollback"
+"version.prune" = "portolan_cli.backends.iceberg.cli:prune"
 
 [project.urls]
 "Homepage" = "https://github.com/portolan-sdi/portolan-cli"
@@ -74,8 +82,16 @@ iceberg = [
 e2e = [
     "boto3>=1.35.0",
 ]
+aws = [
+    # obstore.auth.boto3 wraps a botocore session, which reads every credential
+    # mechanism an AWS profile can name. Optional, because a static key pair and
+    # the environment variables need none of it (Issue #872).
+    "boto3>=1.35.0",
+    # boto3 installs botocore. The profile errors live there, and the upload
+    # path reads ProfileNotFound to tell a missing profile from a failed one.
+    "botocore>=1.35.0",
+]
 dev = [
-    "bandit>=1.9.3",
     "codespell>=2.4.1",
     "deptry>=0.25.1", # Dependency checker (unused, missing, transitive deps)
     "gitingest>=0.1.0", # Auto-fetch API docs for core dependencies
@@ -89,12 +105,10 @@ dev = [
     "pytest-benchmark>=5.0.0",
     "pytest-cov>=4.0.0",
     "pytest-timeout>=2.3.1",
-    "radon>=6.0.1",
     "ruff>=0.14.11",
     "types-defusedxml>=0.7.0", # Type stubs for defusedxml
     "types-PyYAML>=6.0", # Type stubs for PyYAML
     "vulture>=2.14",
-    "xenon>=0.9.3",
 ]
 # PMTiles generation now comes from core geoparquet-io (>=1.4.0), which owns
 # create_pmtiles. The extra stays declared, and empty, so an existing
@@ -109,11 +123,11 @@ thumbnails = [
     "mapbox-vector-tile>=2.0.0", # MVT decoding for PMTiles thumbnail generation
 ]
 docs = [
-    "mkdocs>=1.6.1",
-    "mkdocs-click>=0.8.0", # Auto-generate CLI reference from Click commands
-    "mkdocs-material>=9.7.1",
-    "mkdocstrings[python]>=1.0.0",
-    "pymdown-extensions>=10.21.2", # Fix filename=None bug in highlight extension
+    # Pinned exactly: zensical is alpha with a compiled core, so a floor
+    # constraint is not a constraint. Dependabot offers reviewable bumps.
+    "zensical==0.0.67",
+    "mkdocstrings-python>=1.0.0", # pulls mkdocstrings itself as its own dependency
+    "pymdown-extensions>=11.0", # zensical requires >=11.0; fixes filename=None in highlight
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -146,11 +160,13 @@ markers = [
     "unit: Fast, isolated, no I/O (< 100ms each)",
     "integration: Multi-component, may touch filesystem",
     "network: Requires network access (mocked locally, real in CI nightly)",
+    "refused_hosts: The network guard refuses these hosts without failing the test (child-process requests only)",
     "realdata: Uses real-world fixtures from tests/fixtures/realdata/ (tests orchestration, not geometry)",
     "snapshot: Compares output against golden files",
+    "plugin: Needs the example plugin installed (tests/plugins/portolan_example)",
     "benchmark: Performance measurement, tracked over time",
     "slow: Takes > 5 seconds",
-    "e2e: End-to-end tests requiring Docker (REST catalog + MinIO)",
+    "e2e: End-to-end tests requiring Docker (REST catalog + RustFS)",
     "e2e_slow: Extended E2E tests (concurrency stress, large datasets) - nightly only",
     "source_scan: Static source-tree guard incompatible with mutmut instrumentation",
 ]
@@ -177,8 +193,15 @@ exclude_lines = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# .claude/ holds tooling that portolan-ops syncs into every repo. This repo does
+# not own those files, and a sync run overwrites any fix made here. Raise a rule
+# change in portolan-ops instead.
+extend-exclude = [".claude"]
 
 [tool.ruff.lint]
+# Ruff owns complexity, security, and docstring linting for this repo. It
+# replaces three separate tools that each re-walked the same source tree:
+# xenon/radon (C901), bandit (S), and pylint R0801 (now jscpd, see prek.toml).
 select = [
     "E", # pycodestyle errors
     "W", # pycodestyle warnings
@@ -187,18 +210,110 @@ select = [
     "B", # flake8-bugbear
     "C4", # flake8-comprehensions
     "UP", # pyupgrade
+    "A", # flake8-builtins - shadowing a builtin hides it for the whole scope
+    "ARG", # flake8-unused-arguments - an unused argument is a stale contract
+    "C901", # mccabe complexity - replaces xenon's --max-absolute
+    "D", # pydocstyle - see [tool.ruff.lint.pydocstyle] for the convention
+    "DTZ", # flake8-datetimez - a naive datetime in a STAC temporal extent is a bug
+    "ERA", # eradicate - commented-out code
+    "EXE", # flake8-executable
+    "FURB", # refurb - modern idiom upgrades
+    "G", # flake8-logging-format
+    "ICN", # flake8-import-conventions
+    "INT", # flake8-gettext
+    "ISC", # flake8-implicit-str-concat
+    "LOG", # flake8-logging
+    "N", # pep8-naming
+    "PERF", # perflint
+    "PIE", # flake8-pie
+    "PTH", # flake8-use-pathlib - this repo passes paths everywhere; os.path invites str/Path drift
+    "PYI", # flake8-pyi
+    "Q", # flake8-quotes
+    "RET", # flake8-return
+    "RSE", # flake8-raise
+    "S", # flake8-bandit - replaces the standalone bandit hook
+    "SIM", # flake8-simplify
+    "SLOT", # flake8-slots
+    "T20", # flake8-print - output goes through output.py, never bare print
+    "TC", # flake8-type-checking
+    "YTT", # flake8-2020
 ]
 ignore = [
     "E501", # line too long (handled by formatter)
-    "B008", # do not perform function calls in argument defaults
-    "C901", # too complex
+    "B008", # do not perform function calls in argument defaults (Click uses this)
+    "ISC001", # conflicts with the formatter
+    # Google style documents the constructor arguments in the class docstring.
+    # A separate __init__ docstring repeats them. errors.py alone holds 28
+    # two-line constructors whose class docstring already states the contract.
+    "D107", # missing docstring in __init__
+    # Every hit is a loop that isolates one item's failure and continues. It
+    # writes a file, reads a catalog, or calls a remote store. The handler
+    # cannot move out of the loop, because that aborts the loop on the first
+    # failure. The setup cost is free from Python 3.11 and negligible before it.
+    "PERF203", # try-except within a loop
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+# Tests assert, reach into private helpers, and carry fixture literals that
+# would be magic values in library code. They are still held to the import,
+# naming, and simplification rules.
+"tests/**/*.py" = [
+    "S101", # assert is the point of a test
+    "S105", # "password"-shaped fixture literals
+    "S106",
+    "S108", # /tmp paths in fixtures
+    "D", # test names carry the description; docstrings are optional
+    "ARG", # pytest fixtures are injected and often unused by name
+    "SLF001", # tests may reach into private helpers
+    "T20", # a test may print for diagnostics
+    "PTH123", # open() is fine in a fixture
+    "ERA001", # commented-out fixture variants are deliberate
+    "S603", # a harness starts docker or uv with a literal argument list
+    "S607", # the harness resolves docker and uv from PATH
+    "S310", # a test opens an https URL it writes itself
+    "S311", # random builds test data, not a secret
+    "S608", # a test builds a DuckDB query from a literal path
+]
+"scripts/**/*.py" = [
+    "T20", # scripts are CLIs of their own and print by design
+    "S310", # a script opens an https URL it writes itself
+    "S603", # a script starts a tool or pytest with a literal argument list
+    "S607", # the script resolves its tools from PATH
+]
+"examples/**/*.py" = ["T20"] # an example prints its result for the reader
+
+[tool.ruff.lint.flake8-builtins]
+# STAC names a collection field "license". The ArcGIS REST API and the schema
+# sidecar name a field "format". The keyword arguments carry the same names, so
+# the Python API matches the specification it writes. No function that takes
+# them calls the shadowed builtin.
+builtins-ignorelist = ["license", "format"]
+
+[tool.ruff.lint.pep8-naming]
+# "ET" is the alias the stdlib documentation gives for xml.etree.ElementTree.
+# "InterruptException" mirrors duckdb.InterruptException. convert.py matches
+# that class name as a string, so a test double must use the same name.
+extend-ignore-names = ["ET", "InterruptException"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["portolan_cli"]
+# Every module defers annotation evaluation. This is what makes the TC rules
+# safe here: moving an import into a TYPE_CHECKING block cannot break a runtime
+# annotation when no annotation is evaluated at runtime.
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.pydocstyle]
+# Without an explicit convention ruff enables every D rule, including D413,
+# which alone accounted for 1069 of 1233 D violations. Google is the style the
+# existing docstrings already follow.
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+# The removed xenon hook allowed any block up to grade C (complexity 20). It
+# also checked the module average and the repo average. A single complex
+# function cannot move an average. This is the per-function ceiling instead.
+max-complexity = 15
 
 [tool.ruff.format]
 quote-style = "double"
@@ -210,6 +325,9 @@ docstring-code-format = true
 [tool.mypy]
 python_version = "3.10"
 strict = true # Enables all strict flags at once
+# The example plugin (#947) is a separate package. This path lets mypy check
+# its tests and its code without installing it.
+mypy_path = "tests/plugins/portolan_example/src"
 # pyarrow >=24 ships py.typed but leaves pyarrow.parquet helpers untyped, so
 # strict's disallow_untyped_calls trips on every read_table/write_table/
 # ParquetFile/read_metadata/read_schema call. Scope the suppression to pyarrow
@@ -220,11 +338,18 @@ untyped_calls_exclude = ["pyarrow"]
 module = ["pyarrow.*", "rasterio.*", "gitingest.*", "matplotlib.*", "pyiceberg.*", "shapely.*", "pygeohash.*", "mutmut.*", "geopandas.*", "contextily.*", "jsonschema.*"]
 ignore_missing_imports = true
 
-# ---------- security ----------
+# markdown ships no inline types. types-Markdown exists on PyPI, so mypy
+# reports the missing stub even under ignore_missing_imports, and it reports it
+# against the importing file. One docs test imports markdown's slugify to prove
+# that the anchors the generator writes match the anchors MkDocs renders. The
+# suppression therefore names that one test module.
+[[tool.mypy.overrides]]
+module = ["markdown.*"]
+ignore_missing_imports = true
 
-[tool.bandit]
-exclude_dirs = ["tests", ".venv"]
-skips = [] # Add specific checks to skip if needed, e.g., ["B101"]
+[[tool.mypy.overrides]]
+module = ["docs.test_reference_generation"]
+disable_error_code = ["import-untyped"]
 
 # ---------- spell check ----------
 
@@ -233,7 +358,8 @@ skips = [] # Add specific checks to skip if needed, e.g., ["B101"]
 # French words from Belgian ISO 19139 test fixture (tests/fixtures/csw/belgium_buildings_iso19139.xml)
 # "BU" is the INSPIRE theme code for Buildings (used in test fixtures)
 # "disjointness" is a real set-theory term (codespell wants "disjointedness")
-ignore-words-list = "nd,bu,ue,adresse,projet,environnement,copie,explicite,connexion,objets,visibles,issus,fonction,mesures,informations,disjointness"
+# "lod" is the ArcGIS tile cache term for a level of detail (the tileInfo "lods" array)
+ignore-words-list = "nd,bu,ue,adresse,projet,environnement,copie,explicite,connexion,objets,visibles,issus,fonction,mesures,informations,disjointness,lod"
 
 # ---------- dead code ----------
 
@@ -293,6 +419,9 @@ pytest_add_cli_args = [
 
 [tool.importlinter]
 root_packages = ["portolan_cli"]
+# The layer contracts forbid click and rasterio.
+# import-linter adds those external packages to the graph only with this flag.
+include_external_packages = true
 
 [[tool.importlinter.contracts]]
 id = "cli-no-storage"
@@ -310,15 +439,8 @@ ignore_imports = [
     "portolan_cli.finalization -> portolan_cli.backends",
     "portolan_cli.version_ops -> portolan_cli.backends",
     "portolan_cli.version_ops -> portolan_cli.backends.protocol",
-    "portolan_cli.cli -> portolan_cli.backends.protocol", # TYPE_CHECKING only
+    "portolan_cli.hookspecs -> portolan_cli.backends.protocol", # TYPE_CHECKING only
 ]
-
-[[tool.importlinter.contracts]]
-id = "iceberg-backend-isolation"
-name = "Iceberg backend must not import CLI layer directly"
-type = "forbidden"
-source_modules = ["portolan_cli.backends.iceberg"]
-forbidden_modules = ["portolan_cli.cli"]
 
 [[tool.importlinter.contracts]]
 id = "validation-is-an-adapter"
@@ -392,6 +514,104 @@ source_modules = ["portolan_cli.scan"]
 forbidden_modules = ["portolan_cli.sync", "portolan_cli.viz"]
 allow_indirect_imports = true
 
+# ---------- layers (#944, #947) ----------
+# The package has three layers. A library caller (a Cloud Run job, a notebook,
+# a plugin) imports the read and manage layers without the CLI shell.
+#
+#   read    catalog, collection, and item access. No Click, no rasterio,
+#           no module that writes a catalog.
+#   manage  STAC builders, conversion, extraction, versions.json, sync,
+#           backends. No Click.
+#   cli     cli, cli_types, emit, add_progress, scan.progress. Click and Rich.
+#
+# Each check follows transitive imports, and an import inside a function body
+# counts too.
+
+[[tool.importlinter.contracts]]
+id = "layer-read"
+name = "Read layer: no click, rasterio, or write modules"
+type = "forbidden"
+source_modules = [
+    "portolan_cli.versions",
+    "portolan_cli.json_io",
+    "portolan_cli.bbox",
+    "portolan_cli.models",
+    "portolan_cli.query",
+    "portolan_cli.status",
+    "portolan_cli.catalog_list",
+    "portolan_cli.agents_md",
+]
+forbidden_modules = [
+    "click",
+    "rasterio",
+    "portolan_cli.cli",
+    "portolan_cli.add",
+    "portolan_cli.convert",
+    "portolan_cli.preparation",
+    "portolan_cli.finalization",
+]
+
+[[tool.importlinter.contracts]]
+id = "layer-manage"
+name = "Manage layer: no click"
+type = "forbidden"
+source_modules = ["portolan_cli", "portolan_cli.**"]
+forbidden_modules = ["click"]
+ignore_imports = [
+    # The CLI layer is the one place Click belongs.
+    "portolan_cli.cli -> click",
+    "portolan_cli.cli_types -> click",
+    "portolan_cli.emit -> click",
+    "portolan_cli.plugins.commands -> click",
+    "portolan_cli.backends.iceberg.cli -> click",
+    "portolan_cli.extract.*.cli -> click",
+    "portolan_cli.extract.common.cli_helpers -> click",
+    "portolan_cli.extract.common.layer_cli -> click",
+    # The Extractor protocol names click.Command for type checkers only.
+    "portolan_cli.plugins.extractors -> click",
+    "portolan_cli.plugins.builtin.extractors -> click",
+    "portolan_cli.extract.common.source -> click",
+    # check_extractor runs in a plugin's test suite and checks for a Click command.
+    "portolan_cli.testing -> click",
+    # The package root names the Click group for type checkers only. It loads
+    # the group lazily through __getattr__.
+    "portolan_cli -> portolan_cli.cli",
+]
+
+[[tool.importlinter.contracts]]
+id = "layer-cli"
+name = "CLI layer: only the CLI layer imports it"
+type = "protected"
+protected_modules = [
+    "portolan_cli.cli",
+    "portolan_cli.cli_types",
+    "portolan_cli.emit",
+    "portolan_cli.add_progress",
+    "portolan_cli.scan.progress",
+    "portolan_cli.plugins.commands",
+    "portolan_cli.backends.iceberg.cli",
+    "portolan_cli.extract.*.cli",
+    "portolan_cli.extract.common.cli_helpers",
+    "portolan_cli.extract.common.layer_cli",
+]
+allowed_importers = [
+    "portolan_cli.cli",
+    "portolan_cli.cli_types",
+    "portolan_cli.emit",
+    "portolan_cli.add_progress",
+    "portolan_cli.scan.progress",
+    "portolan_cli.plugins.commands",
+    "portolan_cli.backends.iceberg.cli",
+    "portolan_cli.extract.*.cli",
+    "portolan_cli.extract.common.cli_helpers",
+    "portolan_cli.extract.common.layer_cli",
+]
+ignore_imports = [
+    # The package root names the Click group for type checkers only. It loads
+    # the group lazily through __getattr__.
+    "portolan_cli -> portolan_cli.cli",
+]
+
 # ---------- dependency checking ----------
 # deptry detects unused, missing, and transitive dependencies
 # Rules: DEP001 (missing), DEP002 (unused), DEP003 (transitive), DEP004 (imported as dev)
@@ -438,7 +658,6 @@ dev = [
     "jsonschema>=4.0.0",
     "moto[s3,server]>=5.0.0",
     "numpy>=2.2.6",
-    "pylint>=4.0.5",
     "pytest-asyncio>=1.3.0",
     "pytest-xdist>=3.8.0",
     "types-pyyaml>=6.0.12.20250915",

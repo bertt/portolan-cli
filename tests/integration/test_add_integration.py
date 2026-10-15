@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -25,7 +25,9 @@ from portolan_cli.add import (
     get_item_info,
     list_items,
 )
-from portolan_cli.formats import FormatType
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
@@ -269,7 +271,7 @@ class TestAddIntegration:
         )
 
         assert result.collection_id == "test-vectors"
-        assert result.format_type == FormatType.VECTOR
+        assert result.format_type == "vector"
         assert result.title == "Test Points"
         assert len(result.bbox) == 4
         # Bbox should be valid (not Null Island)
@@ -301,7 +303,7 @@ class TestAddIntegration:
         )
 
         assert result.collection_id == "imagery"
-        assert result.format_type == FormatType.RASTER
+        assert result.format_type == "raster"
         assert len(result.bbox) == 4
 
         # Verify STAC structure (at root level)

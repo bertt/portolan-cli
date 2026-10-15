@@ -9,13 +9,16 @@ from __future__ import annotations
 import json
 import shutil
 import sys
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from click.testing import CliRunner
 
 from portolan_cli.cli import cli
 from portolan_cli.constants import PORTOLAN_SCHEMA_URI
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
@@ -210,6 +213,9 @@ class TestCheckFixDryRun:
 # =============================================================================
 
 
+# check --fix converts two files in spawned workers. A worker draws the
+# thumbnail, and the no_basemap_tiles patch does not reach it.
+@pytest.mark.refused_hosts("a.basemaps.cartocdn.com")
 @pytest.mark.integration
 @pytest.mark.skipif(
     sys.platform == "win32",

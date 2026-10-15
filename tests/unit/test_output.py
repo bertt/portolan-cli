@@ -11,13 +11,20 @@ specifically targeting mutations that survived initial testing:
 
 from __future__ import annotations
 
+import importlib
+import subprocess
+import sys
 from io import StringIO
+from typing import TYPE_CHECKING
 
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from portolan_cli.output import detail, error, info, success, warn
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 class TestOutputFunctions:
@@ -255,95 +262,29 @@ class TestDryRunMode:
         assert message in result or all(char in result for char in message)
 
 
-class TestVerboseMode:
-    """Tests for verbose mode functionality."""
+class TestDryRunAcrossFunctions:
+    """Tests that every output function applies the dry-run prefix."""
 
     @pytest.mark.unit
-    def test_success_with_verbose_includes_message(self) -> None:
-        """success() with verbose=True should include the message."""
+    def test_dry_run_false_omits_prefix(self) -> None:
+        """dry_run=False should not show the dry-run prefix."""
         output = StringIO()
-        success("operation completed", file=output, verbose=True)
-
-        result = output.getvalue()
-        assert "operation completed" in result
-
-    @pytest.mark.unit
-    def test_verbose_does_not_suppress_output(self) -> None:
-        """verbose=True should not suppress any output."""
-        output = StringIO()
-        info("verbose message", file=output, verbose=True)
-
-        result = output.getvalue()
-        assert len(result) > 0
-        assert "verbose message" in result
-
-    @pytest.mark.unit
-    def test_verbose_false_same_as_normal(self) -> None:
-        """verbose=False should produce same output as default."""
-        output_verbose_false = StringIO()
-        output_default = StringIO()
-
-        success("test message", file=output_verbose_false, verbose=False)
-        success("test message", file=output_default)
-
-        # Both should produce identical output
-        assert output_verbose_false.getvalue() == output_default.getvalue()
-
-    @pytest.mark.unit
-    def test_verbose_default_is_false(self) -> None:
-        """Functions should default to verbose=False."""
-        output = StringIO()
-        info("default verbosity", file=output)
-
-        result = output.getvalue()
-        # Should still produce output, just not verbose extras
-        assert len(result) > 0
-
-
-class TestCombinedModes:
-    """Tests for dry-run + verbose mode combinations."""
-
-    @pytest.mark.unit
-    def test_dry_run_and_verbose_both_active(self) -> None:
-        """Both dry_run=True and verbose=True should work together."""
-        output = StringIO()
-        success("operation", file=output, dry_run=True, verbose=True)
-
-        result = output.getvalue()
-        assert "[DRY RUN]" in result
-        assert "operation" in result
-
-    @pytest.mark.unit
-    def test_dry_run_true_verbose_false(self) -> None:
-        """dry_run=True with verbose=False should only show dry-run prefix."""
-        output = StringIO()
-        info("test", file=output, dry_run=True, verbose=False)
-
-        result = output.getvalue()
-        assert "[DRY RUN]" in result
-        assert "test" in result
-
-    @pytest.mark.unit
-    def test_dry_run_false_verbose_true(self) -> None:
-        """dry_run=False with verbose=True should not show dry-run prefix."""
-        output = StringIO()
-        info("test", file=output, dry_run=False, verbose=True)
+        info("test", file=output, dry_run=False)
 
         result = output.getvalue()
         assert "[DRY RUN]" not in result
         assert "test" in result
 
     @pytest.mark.unit
-    def test_all_functions_support_both_modes(self) -> None:
-        """All output functions should accept both dry_run and verbose parameters."""
+    def test_all_functions_support_dry_run(self) -> None:
+        """All output functions should accept dry_run."""
         output = StringIO()
 
-        # Should not raise TypeError
-        success("test", file=output, dry_run=True, verbose=True)
-        error("test", file=output, dry_run=True, verbose=True)
-        info("test", file=output, dry_run=True, verbose=True)
-        warn("test", file=output, dry_run=True, verbose=True)
-        detail("test", file=output, dry_run=True, verbose=True)
+        success("test", file=output, dry_run=True)
+        error("test", file=output, dry_run=True)
+        info("test", file=output, dry_run=True)
+        warn("test", file=output, dry_run=True)
+        detail("test", file=output, dry_run=True)
 
         result = output.getvalue()
         # Each call should produce output
@@ -351,7 +292,7 @@ class TestCombinedModes:
 
 
 class TestModesWithNewlineControl:
-    """Tests ensuring modes work correctly with nl parameter."""
+    """Tests ensuring dry-run mode works correctly with the nl parameter."""
 
     @pytest.mark.unit
     def test_dry_run_with_nl_false(self) -> None:
@@ -364,20 +305,133 @@ class TestModesWithNewlineControl:
         assert not result.endswith("\n")
 
     @pytest.mark.unit
-    def test_verbose_with_nl_false(self) -> None:
-        """Verbose mode should work with nl=False."""
+    def test_warn_dry_run_with_nl_false(self) -> None:
+        """warn() should apply the dry-run prefix with nl=False."""
         output = StringIO()
-        info("test", file=output, verbose=True, nl=False)
-
-        result = output.getvalue()
-        assert not result.endswith("\n")
-
-    @pytest.mark.unit
-    def test_both_modes_with_nl_false(self) -> None:
-        """Both modes should work together with nl=False."""
-        output = StringIO()
-        warn("test", file=output, dry_run=True, verbose=True, nl=False)
+        warn("test", file=output, dry_run=True, nl=False)
 
         result = output.getvalue()
         assert "[DRY RUN]" in result
         assert not result.endswith("\n")
+
+
+class _TTY(StringIO):
+    """A StringIO that reports itself as a terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+@pytest.fixture
+def default_writer() -> Iterator[None]:
+    """Install the click-free writer for one test, then restore the previous one.
+
+    Importing ``portolan_cli.cli`` installs the click writer for the whole
+    session, so a test of the default writer installs it explicitly.
+    """
+    from portolan_cli import output
+
+    previous = output.get_writer()
+    output.set_writer(output.default_writer)
+    try:
+        yield
+    finally:
+        output.set_writer(previous)
+
+
+class TestWriter:
+    """The writer that turns a styled message into terminal output (#947).
+
+    Library callers must not load Click, so ``output`` has its own writer.
+    ``cli.py`` installs a writer that uses ``click.echo``.
+    """
+
+    @pytest.mark.unit
+    @pytest.mark.usefixtures("default_writer")
+    def test_default_writer_omits_color_when_not_a_terminal(self) -> None:
+        """A pipe or a file gets the plain prefix and message."""
+        stream = StringIO()
+
+        success("hello", file=stream)
+
+        assert stream.getvalue() == "✓ hello\n"
+
+    @pytest.mark.unit
+    @pytest.mark.usefixtures("default_writer")
+    def test_default_writer_colors_a_terminal_like_click(self) -> None:
+        """A terminal gets the same ANSI codes that ``click.style`` makes."""
+        import click
+
+        stream = _TTY()
+
+        success("hello", file=stream)
+        detail("step", file=stream, nl=False)
+
+        expected = (
+            f"{click.style('✓', fg='green')} {click.style('hello', fg='green')}\n"
+            f"{click.style(' ', dim=True)} {click.style('step', dim=True)}"
+        )
+        assert stream.getvalue() == expected
+
+    @pytest.mark.unit
+    @pytest.mark.usefixtures("default_writer")
+    def test_default_writer_resolves_stdout_at_call_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A replaced ``sys.stdout`` receives the message, as ``click.echo`` does."""
+        import sys
+
+        stream = StringIO()
+        monkeypatch.setattr(sys, "stdout", stream)
+
+        info("now")
+
+        assert stream.getvalue() == "→ now\n"
+
+    @pytest.mark.unit
+    def test_set_writer_routes_every_message(self) -> None:
+        """An installed writer receives the prefix, message, and style."""
+        from portolan_cli import output
+
+        calls: list[tuple[str, str, str | None, bool, bool]] = []
+
+        def _record(
+            prefix: str,
+            message: str,
+            *,
+            fg: str | None,
+            dim: bool,
+            file: object,
+            nl: bool,
+        ) -> None:
+            calls.append((prefix, message, fg, dim, nl))
+
+        previous = output.get_writer()
+        output.set_writer(_record)
+        try:
+            error("bad", nl=False)
+            detail("quiet")
+        finally:
+            output.set_writer(previous)
+
+        assert calls == [("✗", "bad", "red", False, False), (" ", "quiet", None, True, True)]
+
+    @pytest.mark.unit
+    def test_importing_cli_installs_the_click_writer(self) -> None:
+        """The CLI writes through ``click.echo``, so CliRunner and Windows behave as before."""
+        from portolan_cli import output
+
+        cli_module = importlib.import_module("portolan_cli.cli")
+
+        assert output.get_writer() is cli_module.click_writer
+
+    @pytest.mark.unit
+    def test_output_module_does_not_import_click(self) -> None:
+        """``import portolan_cli.output`` leaves Click unloaded."""
+        code = "import sys, portolan_cli.output; print('click' in sys.modules)"
+
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True
+        )
+
+        assert result.stdout.strip() == "False"

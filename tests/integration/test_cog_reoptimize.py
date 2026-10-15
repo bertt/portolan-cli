@@ -16,12 +16,15 @@ not raster math.
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 import rasterio
 from rasterio.transform import from_bounds
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _make_cog_without_overviews(path: Path, size: int = 1500) -> Path:
@@ -100,12 +103,25 @@ class TestConvertFileForce:
         assert _overview_count(cog) == 0
 
     @pytest.mark.integration
-    def test_force_does_not_touch_geoparquet(self, valid_points_parquet: Path) -> None:
-        """force is raster-scoped: a valid GeoParquet stays SKIPPED."""
+    def test_force_does_not_touch_geoparquet(
+        self, valid_points_parquet: Path, tmp_path: Path
+    ) -> None:
+        """force is raster-scoped: a valid GeoParquet stays SKIPPED and unchanged.
+
+        The test works on a copy, so a regression cannot rewrite the shared fixture.
+        """
+        import shutil
+
         from portolan_cli.convert import ConversionStatus, convert_file
 
-        result = convert_file(valid_points_parquet, force=True)
+        source = tmp_path / valid_points_parquet.name
+        shutil.copy2(valid_points_parquet, source)
+        before = source.read_bytes()
 
+        result = convert_file(source, force=True)
+
+        assert source.read_bytes() == before
+        assert not source.with_name(f"{source.stem}.thumb.jpg").exists()
         assert result.status == ConversionStatus.SKIPPED
         assert result.output is None
         assert result.format_from == "GeoParquet"

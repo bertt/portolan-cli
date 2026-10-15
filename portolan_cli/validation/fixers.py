@@ -196,8 +196,9 @@ def _expected_structural_links(node: Node, graph: CatalogGraph) -> list[tuple[st
         enclosing = _enclosing_collection(node, graph)
         if enclosing is not None:
             expected.append(("collection", enclosing))
-    for child in graph.children_of(node):
-        expected.append(("item" if child.kind == "item" else "child", child))
+    expected.extend(
+        ("item" if child.kind == "item" else "child", child) for child in graph.children_of(node)
+    )
     return expected
 
 
@@ -282,13 +283,19 @@ def _extent_bboxes(node: Node) -> list[Any] | None:
 
 
 def _looks_valid(box: Any) -> bool:
-    from portolan_cli.bbox import is_valid_bbox, to_2d_bbox
+    from portolan_cli.bbox import is_valid_bbox, snap_to_wgs84_range, to_2d_bbox
 
     if not isinstance(box, list) or len(box) not in (4, 6):
         return False
     if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in box):
         return False
-    return is_valid_bbox(to_2d_bbox(box))
+    flat = to_2d_bbox(box)
+    if not is_valid_bbox(flat):
+        return False
+    # A coordinate a hair past the bound validates once snapped, so
+    # is_valid_bbox accepts it. The stored extent still carries the raw value,
+    # and replacing it is what this fixer is for.
+    return snap_to_wgs84_range(flat) == flat
 
 
 def _child_bboxes(node: Node, graph: CatalogGraph) -> list[list[float]]:
@@ -869,7 +876,7 @@ def _fix_pmtiles(root: Path, dry_run: bool) -> list[FixResult]:
     return repair_pmtiles_links(root, dry_run=dry_run)
 
 
-def _fix_convert(root: Path, dry_run: bool) -> list[FixResult]:
+def _fix_convert(root: Path, _dry_run: bool) -> list[FixResult]:
     """Registered but deliberately inert: conversion belongs to the geo-asset pass.
 
     PTL-DAT-003 names this key, so the registry must carry it. Running a

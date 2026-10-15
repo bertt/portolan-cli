@@ -11,13 +11,17 @@ These tests verify:
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from click.testing import CliRunner
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
 
 
 @pytest.fixture
@@ -969,7 +973,6 @@ class TestAssetPathResolution:
         assets = _get_assets_to_upload(
             catalog_root=catalog_with_versions,
             versions_data=versions_data,
-            versions_to_push=["1.1.0"],
         )
 
         # Should return list of asset paths
@@ -1815,7 +1818,7 @@ class TestPushAssetDiffingIntegration:
         async def mock_put(store, path, data, **kwargs):
             """Mock put that accepts any keyword arguments."""
             uploaded_assets.append(path)
-            return None
+            return
 
         with patch(
             "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
@@ -1844,3 +1847,69 @@ class TestPushAssetDiffingIntegration:
         # The existing files should NOT be in the upload list
         assert not any("existing1.parquet" in p for p in parquet_uploads)
         assert not any("existing2.parquet" in p for p in parquet_uploads)
+
+
+@pytest.fixture
+def broken_profile_environ(tmp_path: Path) -> Iterator[None]:
+    """Point the AWS files at a profile whose credential_process exits nonzero."""
+    import sys
+
+    from tests.conftest import cleared_environ
+
+    aws_dir = tmp_path / ".aws"
+    aws_dir.mkdir()
+    helper = tmp_path / "broken_helper.py"
+    helper.write_text("import sys\nprint('vault is locked', file=sys.stderr)\nsys.exit(1)\n")
+    (aws_dir / "config").write_text(
+        f"[profile broken]\ncredential_process = {sys.executable} {helper}\nregion = us-west-2\n"
+    )
+    with cleared_environ(
+        AWS_CONFIG_FILE=str(aws_dir / "config"),
+        AWS_SHARED_CREDENTIALS_FILE=str(aws_dir / "credentials"),
+    ):
+        yield
+
+
+class TestBrokenProfileCli:
+    """A profile whose credential source fails stops the command without a traceback."""
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["push", "--dry-run"],
+            ["push", "--collection", "demographics", "--dry-run"],
+            ["push", "--collection", "demographics", "--json"],
+            ["push", "--json"],
+            ["sync", "--collection", "demographics", "--dry-run"],
+        ],
+        ids=["push-all", "push-one", "push-one-json", "push-all-json", "sync"],
+    )
+    @pytest.mark.usefixtures("broken_profile_environ")
+    def test_failing_credential_process_exits_cleanly(
+        self, catalog_with_versions: Path, args: list[str]
+    ) -> None:
+        pytest.importorskip("boto3")
+        from portolan_cli.cli import cli
+
+        # push_all_collections refuses a catalog without its config file.
+        (catalog_with_versions / ".portolan").mkdir(exist_ok=True)
+        (catalog_with_versions / ".portolan" / "config.yaml").touch()
+        command, *options = args
+        result = CliRunner().invoke(
+            cli,
+            [
+                command,
+                "s3://mybucket/catalog",
+                *options,
+                "--profile",
+                "broken",
+                "--catalog",
+                str(catalog_with_versions),
+            ],
+        )
+
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert result.exit_code == 1
+        assert "PRTLN-CFG004" in result.output
+        assert "broken" in result.output

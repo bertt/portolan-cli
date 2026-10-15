@@ -4,10 +4,11 @@ Tests rollback, prune, list, and current commands through the full
 CLI pipeline with the iceberg backend.
 """
 
-from unittest.mock import patch
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import pytest
-from click.testing import CliRunner
 
 from portolan_cli.cli import cli
 from tests.iceberg.integration.conftest import (
@@ -18,15 +19,17 @@ from tests.iceberg.integration.conftest import (
     place_geojson_in_collection,
 )
 
+if TYPE_CHECKING:
+    from click.testing import CliRunner
+
 
 def _invoke_version_cmd(runner: CliRunner, catalog_root, args: list[str]):
-    """Run a `portolan version` subcommand with config isolation."""
-    with patch("portolan_cli.backends.iceberg.config._get_external_config", return_value=None):
-        return runner.invoke(
-            cli,
-            ["version", *args, "--catalog", str(catalog_root)],
-            catch_exceptions=False,
-        )
+    """Run a `portolan version` subcommand."""
+    return runner.invoke(
+        cli,
+        ["version", *args, "--catalog", str(catalog_root)],
+        catch_exceptions=False,
+    )
 
 
 def _add_two_versions(initialized_iceberg_catalog, runner):

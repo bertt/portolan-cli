@@ -14,16 +14,11 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 from click.testing import CliRunner
 
 from portolan_cli.cli import cli
-
-if TYPE_CHECKING:
-    pass
-
 
 # =============================================================================
 # Fixtures
@@ -361,6 +356,9 @@ class TestRemoveLegacyEdgeCases:
         sys.platform == "win32",
         reason="geoparquet-io segfaults on malformed input on Windows (upstream bug)",
     )
+    # check --fix converts two files in spawned workers. A worker draws the
+    # thumbnail, and the no_basemap_tiles patch does not reach it.
+    @pytest.mark.refused_hosts("a.basemaps.cartocdn.com")
     def test_mixed_success_failure(
         self,
         runner: CliRunner,

@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from portolan_cli.formats import FormatType, detect_format
-from portolan_cli.metadata.cog import extract_cog_metadata
-from portolan_cli.metadata.geoparquet import extract_geoparquet_metadata
+from portolan_cli.stac_links import catalog_collections
 from portolan_cli.stac_parquet import count_items
 from portolan_cli.versions import read_versions
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @dataclass
@@ -233,18 +233,17 @@ def inspect_file(path: Path, *, catalog_root: Path | None = None) -> FileInfo:
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    # Detect format
-    format_type = detect_format(path)
+    # The format handler describes its own format (#947).
+    from portolan_cli.plugins.formats import handler_for
 
-    if format_type == FormatType.VECTOR:
-        return _inspect_geoparquet(path, catalog_root=catalog_root)
-    elif format_type == FormatType.RASTER:
-        return _inspect_cog(path, catalog_root=catalog_root)
-    else:
+    handler = handler_for(path, catalog_root)
+    if handler is None:
         raise ValueError(f"Unsupported file format: {path.suffix}")
+    info: FileInfo = handler.inspect(path, catalog_root)
+    return info
 
 
-def _inspect_geoparquet(path: Path, *, catalog_root: Path | None = None) -> FileInfo:
+def inspect_geoparquet(path: Path, *, catalog_root: Path | None = None) -> FileInfo:
     """Extract metadata from a GeoParquet file.
 
     Args:
@@ -254,6 +253,9 @@ def _inspect_geoparquet(path: Path, *, catalog_root: Path | None = None) -> File
     Returns:
         FileInfo with GeoParquet metadata.
     """
+    # Lazy: the extractor loads pyarrow, and importing inspect must not (#944).
+    from portolan_cli.metadata.geoparquet import extract_geoparquet_metadata
+
     metadata = extract_geoparquet_metadata(path)
 
     # Look up version if catalog_root provided
@@ -276,7 +278,7 @@ def _inspect_geoparquet(path: Path, *, catalog_root: Path | None = None) -> File
     )
 
 
-def _inspect_cog(path: Path, *, catalog_root: Path | None = None) -> FileInfo:
+def inspect_cog(path: Path, *, catalog_root: Path | None = None) -> FileInfo:
     """Extract metadata from a COG file.
 
     Args:
@@ -286,6 +288,9 @@ def _inspect_cog(path: Path, *, catalog_root: Path | None = None) -> FileInfo:
     Returns:
         FileInfo with COG metadata.
     """
+    # Lazy: the extractor loads rasterio, and importing inspect must not (#944).
+    from portolan_cli.metadata.cog import extract_cog_metadata
+
     metadata = extract_cog_metadata(path)
 
     # Look up version if catalog_root provided
@@ -356,7 +361,7 @@ def _lookup_version(path: Path, catalog_root: Path) -> str | None:
     # Determine item_id from path (parent directory name)
     item_id = path.parent.name if path.parent != catalog_root else ""
 
-    for asset_name, _asset in current_version_obj.assets.items():
+    for asset_name in current_version_obj.assets:
         # Check item-scoped key format (new format)
         if item_id and asset_name == f"{item_id}/{filename}":
             return f"v{versions_file.current_version}"
@@ -440,9 +445,10 @@ def inspect_catalog(catalog_root: Path) -> CatalogInfo:
 
     data = json.loads(catalog_json_path.read_text(encoding="utf-8"))
 
-    # Count collections from child links
-    child_links = [link for link in data.get("links", []) if link.get("rel") == "child"]
-    collection_count = len(child_links)
+    # The containment walk counts the same collections as `check` (#944). A
+    # child link to a sub-catalog is not a collection, and an unlinked
+    # collection still is one.
+    collection_count = len(catalog_collections(catalog_root))
 
     return CatalogInfo(
         catalog_id=data.get("id", catalog_root.name),

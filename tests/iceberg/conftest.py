@@ -1,5 +1,8 @@
 """Shared test fixtures for iceberg backend tests."""
 
+from __future__ import annotations
+
+import os
 import sys
 
 import pyarrow as pa
@@ -13,6 +16,38 @@ from pyiceberg.catalog import load_catalog
 # PyIceberg doesn't run CI on Windows: https://github.com/apache/iceberg-python/issues/2477
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pyiceberg_config(tmp_path, monkeypatch):
+    """Hide the developer's ~/.pyiceberg.yaml from every test in this suite.
+
+    PyIceberg reads a catalog definition from the first ``.pyiceberg.yaml`` it
+    finds, searching ``PYICEBERG_HOME``, then the home directory, then the
+    current directory. A developer who has ever pointed the CLI at a REST or
+    BigLake catalog has one in their home directory, and these tests then load
+    that catalog instead of the temporary SQLite one. The failure is remote and
+    credential-dependent, so it reproduces for one person and not for CI.
+
+    The fixture puts a stub ``.pyiceberg.yaml`` in ``PYICEBERG_HOME``, so the
+    search stops there. PyIceberg skips a file with no keys, so the stub holds
+    one key that PyIceberg does not read.
+
+    The home directory stays real. DuckDB keeps its extensions in
+    ``~/.duckdb``. An empty home directory made geoparquet-io download the
+    77 MB spatial extension again in each test.
+
+    PyIceberg also builds a catalog from ``PYICEBERG_CATALOG__{NAME}__{KEY}``
+    environment variables, and it reads them whatever the home directory holds.
+    A developer who exports one in the shell hits the same remote catalog, so
+    the fixture removes them too.
+    """
+    home = tmp_path / "pyiceberg-home"
+    home.mkdir()
+    (home / ".pyiceberg.yaml").write_text("portolan-test-isolation: true\n", encoding="utf-8")
+    monkeypatch.setenv("PYICEBERG_HOME", str(home))
+    for name in [n for n in os.environ if n.startswith("PYICEBERG_CATALOG__")]:
+        monkeypatch.delenv(name)
+
+
 @pytest.fixture
 def iceberg_catalog(tmp_path):
     """Create a temporary Iceberg catalog backed by SQLite."""
@@ -24,11 +59,9 @@ def iceberg_catalog(tmp_path):
     warehouse_uri = (tmp_path / "warehouse").as_uri()
     return load_catalog(
         "test",
-        **{
-            "type": "sql",
-            "uri": f"sqlite:///{tmp_path}/catalog.db",
-            "warehouse": warehouse_uri,
-        },
+        type="sql",
+        uri=f"sqlite:///{tmp_path}/catalog.db",
+        warehouse=warehouse_uri,
     )
 
 

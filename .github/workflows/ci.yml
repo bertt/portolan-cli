@@ -50,6 +50,10 @@ jobs:
               - 'portolan_cli/backends/iceberg/**'
               - 'tests/iceberg/**'
               - 'pyproject.toml'
+              # pyiceberg can move in the lock alone, through a transitive
+              # bump or an explicit upgrade. Without this the Iceberg jobs
+              # skip the very change that needs them.
+              - 'uv.lock'
             python:
               - 'portolan_cli/**/*.py'
 
@@ -63,7 +67,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.6.14"
 
@@ -82,8 +86,7 @@ jobs:
         # ONE rule source: CI runs the SAME hooks developers run locally
         # (prek.toml), not a re-listing of each tool with its own drifting args.
         # This covers ruff, ruff-format, mypy, import-linter, codespell, vulture,
-        # xenon, pylint-duplicate, bandit, deptry,
-        # actionlint, zizmor, and the builtin file hooks.
+        # jscpd, deptry, actionlint, zizmor, and the builtin file hooks.
         #
         # SKIP:
         # - no-commit-to-branch: meaningless in CI and fails on push-to-main
@@ -107,7 +110,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.6.14"
 
@@ -125,7 +128,7 @@ jobs:
       - name: Audit dependencies (runtime + extras only)
         # Audit only what we ship: core runtime deps plus the publishable extras
         # (iceberg, pmtiles, thumbnails). Dev-group deps (moto, pytest, pip-audit
-        # itself...) and doc-build deps (mkdocs, pymdown-extensions...) are excluded
+        # itself...) and doc-build deps (zensical, pymdown-extensions...) are excluded
         # because they never reach users via the wheel.
         #
         # Ignores come from the single-source .pip-audit-ignores file (each entry
@@ -175,7 +178,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.6.14"
 
@@ -237,11 +240,60 @@ jobs:
 
       - name: Upload coverage reports to Codecov
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: portolan-sdi/portolan-cli
           flags: main
+
+  plugin-test:
+    # The example plugin uses the public plugin API alone (#947). A change to
+    # portolan_cli.api or portolan_cli.hookspecs that breaks a plugin fails here.
+    name: Example Plugin (Python ${{ matrix.python-version }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python-version: '3.10'}
+          - {os: windows-latest, python-version: '3.13'}
+    env:
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.6.14"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 10
+          command: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: uv sync --all-extras
+
+      # Install into the project environment. With uv 0.6.14, `uv run --with`
+      # built its overlay on the runner's system Python, not the synced 3.10
+      # environment, and pytest could not import the plugin.
+      - name: Install the example plugin
+        run: uv pip install ./tests/plugins/portolan_example
+
+      - name: Run the example plugin tests
+        run: uv run --no-sync pytest tests/plugins -m plugin --tb=short
 
   iceberg-test:
     name: Iceberg Unit & Integration Tests (Python ${{ matrix.python-version }} / ${{ matrix.os }})
@@ -262,7 +314,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.6.14"
 
@@ -287,7 +339,7 @@ jobs:
 
       - name: Upload coverage reports to Codecov
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: portolan-sdi/portolan-cli
@@ -309,7 +361,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.6.14"
 
@@ -335,8 +387,8 @@ jobs:
       - name: Wait for REST catalog
         run: timeout 60 bash -c 'until curl -sf http://localhost:8181/v1/config; do sleep 2; done'
 
-      - name: Wait for MinIO
-        run: timeout 60 bash -c 'until curl -sf http://localhost:9000/minio/health/live; do sleep 2; done'
+      - name: Wait for RustFS
+        run: timeout 60 bash -c 'until curl -sf http://localhost:9000/health/live; do sleep 2; done'
 
       - name: Run E2E tests (fast tier, excludes e2e_slow)
         run: uv run pytest tests/iceberg/e2e/ -v --tb=long -m "e2e and not e2e_slow" --timeout=120
@@ -359,7 +411,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.6.14"
 
@@ -378,37 +430,58 @@ jobs:
         run: uv run python scripts/generate_reference_docs.py --check
 
       - name: Build documentation
-        run: uv run mkdocs build --strict
+        run: uv run zensical build --strict --clean
 
-      - name: Start MinIO for documentation example
+      # The example pushes and reads with no credentials. The bucket policy
+      # grants anonymous read and write on portolan-docs only.
+      - name: Start RustFS for documentation example
         run: |
-          docker compose -f tests/iceberg/e2e/docker-compose.yml up -d minio
-          timeout 60 bash -c 'until curl -sf http://localhost:9000/minio/health/live; do sleep 2; done'
-          docker compose -f tests/iceberg/e2e/docker-compose.yml run --rm --entrypoint /bin/sh minio-init -c 'mc alias set local http://minio:9000 minioadmin minioadmin; mc mb local/portolan-docs || true; mc anonymous set public local/portolan-docs'
+          docker compose -f tests/iceberg/e2e/docker-compose.yml up -d rustfs
+          timeout 60 bash -c 'until curl -sf http://localhost:9000/health/live; do sleep 2; done'
+          docker compose -f tests/iceberg/e2e/docker-compose.yml run --rm --no-deps \
+            -v "$PWD/tests/docs/portolan-docs-bucket-policy.json:/policy.json:ro" \
+            --entrypoint /bin/sh rustfs-init -ec \
+            'aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket portolan-docs || aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket portolan-docs; aws --endpoint-url http://rustfs:9000 s3api put-bucket-policy --bucket portolan-docs --policy file:///policy.json'
 
       - name: Test documentation examples
         env:
           AWS_REGION: us-east-1
-          PORTOLAN_DOCS_MINIO: "1"
+          PORTOLAN_DOCS_RUSTFS: "1"
           PORTOLAN_S3_ENDPOINT: localhost:9000
           PORTOLAN_S3_USE_SSL: "false"
         run: uv run pytest tests/docs/ -v --tb=short
 
       - name: Upload documentation preview
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: documentation-site
           path: site
           retention-days: 7
 
-      - name: MinIO logs
+      - name: RustFS logs
         if: failure()
         run: docker compose -f tests/iceberg/e2e/docker-compose.yml logs
 
-      - name: Stop MinIO
+      - name: Stop RustFS
         if: always()
         run: docker compose -f tests/iceberg/e2e/docker-compose.yml down -v
+
+  # Checks the relative links in the built site. zensical --strict checks
+  # Markdown links only. This also covers theme templates, navigation, and
+  # raw HTML. The docs job uploads the site on pull requests only.
+  site-links:
+    needs: docs
+    if: github.event_name == 'pull_request'
+    uses: portolan-sdi/portolan-ops/.github/workflows/reusable-links.yml@v1
+    permissions:
+      contents: read
+      # The reusable job declares issues: write for its weekly mode. A
+      # caller must grant at least that, even though this mode never
+      # writes an issue.
+      issues: write
+    with:
+      site-artifact: documentation-site
 
   build:
     name: Build Package
@@ -420,7 +493,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.6.14"
 
@@ -442,7 +515,7 @@ jobs:
     # check, and the conditionally-skipped iceberg jobs don't block PRs that
     # don't touch iceberg.
     if: always()
-    needs: [quality, security, test, iceberg-test, iceberg-e2e, docs, build]
+    needs: [quality, security, test, iceberg-test, iceberg-e2e, docs, site-links, build]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

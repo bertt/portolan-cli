@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from portolan_cli.versions import Asset, SchemaInfo, Version, parse_version
+from portolan_cli.api import Asset, SchemaInfo, Version, parse_version
 
 if TYPE_CHECKING:
     from pyiceberg.table.snapshots import Snapshot
@@ -173,7 +173,7 @@ def build_assets(
 def _compute_sha256(path: Path) -> str:
     """Compute SHA-256 hex digest of a file."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with Path(path).open("rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()

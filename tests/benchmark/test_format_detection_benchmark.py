@@ -6,11 +6,14 @@ These benchmarks establish baselines and catch regressions.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from portolan_cli.formats import FormatType, detect_format
+from portolan_cli.formats import detect_format
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestFormatDetectionBenchmarks:
@@ -24,7 +27,7 @@ class TestFormatDetectionBenchmarks:
     ) -> None:
         """Benchmark GeoJSON detection speed."""
         result = benchmark(detect_format, valid_points_geojson)
-        assert result == FormatType.VECTOR
+        assert result == "vector"
 
     @pytest.mark.benchmark(group="format-detection")
     def test_detect_parquet_performance(
@@ -34,7 +37,7 @@ class TestFormatDetectionBenchmarks:
     ) -> None:
         """Benchmark Parquet detection speed (extension-only, should be fastest)."""
         result = benchmark(detect_format, valid_points_parquet)
-        assert result == FormatType.VECTOR
+        assert result == "vector"
 
     @pytest.mark.benchmark(group="format-detection")
     def test_detect_tiff_performance(
@@ -44,7 +47,7 @@ class TestFormatDetectionBenchmarks:
     ) -> None:
         """Benchmark TIFF detection speed."""
         result = benchmark(detect_format, valid_rgb_cog)
-        assert result == FormatType.RASTER
+        assert result == "raster"
 
     @pytest.mark.benchmark(group="format-detection")
     def test_detect_json_needing_content_check(
@@ -58,4 +61,4 @@ class TestFormatDetectionBenchmarks:
         json_file.write_text('{"type": "FeatureCollection", "features": []}')
 
         result = benchmark(detect_format, json_file)
-        assert result == FormatType.VECTOR
+        assert result == "vector"

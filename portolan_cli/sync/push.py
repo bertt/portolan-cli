@@ -81,8 +81,6 @@ class PushConflictError(Exception):
     - Remote versions.json changed during push (etag mismatch)
     """
 
-    pass
-
 
 # =============================================================================
 # Data Classes
@@ -243,12 +241,11 @@ def format_file_size(size_bytes: int) -> str:
     """
     if size_bytes < 1024:
         return f"{size_bytes} B"
-    elif size_bytes < 1024 * 1024:
+    if size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KB"
-    elif size_bytes < 1024 * 1024 * 1024:
+    if size_bytes < 1024 * 1024 * 1024:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
-    else:
-        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
 
 
 def format_speed(bytes_per_second: float) -> str:
@@ -264,12 +261,11 @@ def format_speed(bytes_per_second: float) -> str:
     """
     if bytes_per_second < 1024:
         return f"{int(bytes_per_second)} B/s"
-    elif bytes_per_second < 1024 * 1024:
+    if bytes_per_second < 1024 * 1024:
         return f"{bytes_per_second / 1024:.1f} KiB/s"
-    elif bytes_per_second < 1024 * 1024 * 1024:
+    if bytes_per_second < 1024 * 1024 * 1024:
         return f"{bytes_per_second / (1024 * 1024):.1f} MiB/s"
-    else:
-        return f"{bytes_per_second / (1024 * 1024 * 1024):.1f} GiB/s"
+    return f"{bytes_per_second / (1024 * 1024 * 1024):.1f} GiB/s"
 
 
 # =============================================================================
@@ -308,7 +304,7 @@ def _transform_collection_glob_assets(
     assets = data.get("assets", {})
     modified = False
 
-    for _asset_key, asset_data in assets.items():
+    for asset_data in assets.values():
         href = asset_data.get("href", "")
         # Check if this is a glob pattern (contains *)
         if "*" in href:
@@ -457,44 +453,66 @@ def _fetch_remote_versions(
 # =============================================================================
 
 
-def _build_remote_asset_set(
-    remote_versions_data: dict[str, Any] | None,
-) -> set[tuple[str, str]]:
-    """Build set of (href, sha256) pairs from all assets in all remote versions.
+def _current_snapshot(versions_data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the current version entry of a versions.json document.
+
+    The entry that ``current_version`` names is the current snapshot. When that
+    field is missing or names no entry, the last entry in ``versions`` is used.
 
     Args:
-        remote_versions_data: Remote versions.json data, or None if no remote.
+        versions_data: Local or remote versions.json data, or None.
 
     Returns:
-        Set of (href, sha256) tuples from all remote assets.
-        Both href and sha256 must match for an asset to be considered "already exists".
-        This ensures renamed files (same sha256, different href) are still uploaded.
+        The current version entry, or None when there is no data or no version.
     """
-    if remote_versions_data is None:
-        return set()
+    if versions_data is None:
+        return None
 
-    remote_assets: set[tuple[str, str]] = set()
-    for version_entry in remote_versions_data.get("versions", []):
-        for asset_name, asset_data in version_entry.get("assets", {}).items():
-            href = asset_data.get("href", asset_name)
-            sha256 = asset_data.get("sha256")
-            if sha256 and href:
-                remote_assets.add((href, sha256))
+    versions: list[dict[str, Any]] = versions_data.get("versions", [])
+    if not versions:
+        return None
 
-    return remote_assets
+    current_name = versions_data.get("current_version")
+    return next((v for v in versions if v.get("version") == current_name), versions[-1])
+
+
+def _snapshot_hashes(snapshot: dict[str, Any] | None) -> dict[str, str | None]:
+    """Map each href in a version snapshot to its sha256.
+
+    Args:
+        snapshot: One versions.json entry, or None.
+
+    Returns:
+        A dict from href to sha256. A malformed asset without a sha256 maps
+        to None. The dict is empty when ``snapshot`` is None.
+    """
+    if snapshot is None:
+        return {}
+
+    hashes: dict[str, str | None] = {}
+    for asset_name, asset_data in snapshot.get("assets", {}).items():
+        hashes[asset_data.get("href", asset_name)] = asset_data.get("sha256")
+    return hashes
 
 
 def _get_assets_to_upload(
     catalog_root: Path,
     versions_data: dict[str, Any],
-    versions_to_push: list[str],
     remote_versions_data: dict[str, Any] | None = None,
 ) -> list[Path]:
     """Get list of asset files that need to be uploaded.
 
-    Compares local assets against remote by sha256 hash. Only assets that are
-    new or changed (different sha256) are included. This prevents re-uploading
-    unchanged assets when adding a single file to a large catalog (Issue #329).
+    Compares the local current snapshot with the remote current snapshot by
+    href and sha256. Only assets that are new or changed are included. This
+    prevents re-uploading unchanged assets when adding a single file to a
+    large catalog (Issue #329).
+
+    Both sides use the current snapshot only (Issue #962). Asset hrefs carry no
+    version segment, so every version writes the same object key. Only the
+    remote current snapshot tells what each key holds now. After the push, the
+    remote current version is the local current version, and the disk holds
+    the bytes that the local current snapshot records. An older local version
+    cannot have its own bytes uploaded, because they share the same key.
 
     A recorded asset that is absent from disk raises. One exception applies. An
     optional derivative only warns, and this function skips it (Issue #735). The
@@ -504,9 +522,9 @@ def _get_assets_to_upload(
     Args:
         catalog_root: Path to catalog root.
         versions_data: Local versions.json data.
-        versions_to_push: List of version strings to push.
         remote_versions_data: Remote versions.json data for sha256 comparison.
-            If None, all assets from versions_to_push are uploaded (first push).
+            If None, every asset of the local current snapshot is uploaded
+            (first push).
 
     Returns:
         List of absolute paths to asset files that need to be uploaded.
@@ -515,53 +533,37 @@ def _get_assets_to_upload(
         FileNotFoundError: If a referenced ``data`` or ``source`` asset file
             doesn't exist.
     """
-    # Build set of (href, sha256) pairs from all remote versions
-    remote_assets = _build_remote_asset_set(remote_versions_data)
+    local_current = _current_snapshot(versions_data)
+    version_str = local_current.get("version") if local_current else None
+    remote_assets = _snapshot_hashes(_current_snapshot(remote_versions_data))
 
     assets_to_upload: list[Path] = []
-    seen_hrefs: set[str] = set()
     skipped_count = 0
 
-    for version_entry in versions_data.get("versions", []):
-        version_str = version_entry.get("version")
-        if version_str not in versions_to_push:
+    for href, local_sha256 in _snapshot_hashes(local_current).items():
+        # Skip the upload only if the remote current snapshot records the same
+        # sha256 for the same href. A renamed file (same sha256, new href)
+        # still uploads.
+        if local_sha256 and remote_assets.get(href) == local_sha256:
+            skipped_count += 1
             continue
 
-        for asset_name, asset_data in version_entry.get("assets", {}).items():
-            href = asset_data.get("href", asset_name)
-
-            # Skip if we've already processed this asset path
-            if href in seen_hrefs:
+        # Resolve path relative to catalog root
+        asset_path = catalog_root / href
+        if not asset_path.exists():
+            # The spec calls four roles optional derivatives, namely
+            # `visual`, `thumbnail`, `style` and `collection-mirror`. See
+            # portolan-spec specs/portolan/core.md, sections Assets and
+            # Single-File Collections. Portolan rebuilds each one from data
+            # the catalog still holds. An absent one must not fail a sound
+            # push (Issue #735). Conformance gaps belong to `portolan check`.
+            # Roles `data` and `source` stay a hard error, because nothing
+            # can reconstruct them.
+            if is_optional_derivative(catalog_root, href):
+                warn(f"Optional asset not found, skipped: {href} (version {version_str})")
                 continue
-            seen_hrefs.add(href)
-
-            # Get local sha256 (may be None if malformed)
-            local_sha256 = asset_data.get("sha256")
-
-            # Skip upload only if BOTH href AND sha256 match remote
-            # This ensures renamed files (same sha256, different href) are uploaded
-            if local_sha256 and (href, local_sha256) in remote_assets:
-                skipped_count += 1
-                continue
-
-            # Resolve path relative to catalog root
-            asset_path = catalog_root / href
-            if not asset_path.exists():
-                # The spec calls four roles optional derivatives, namely
-                # `visual`, `thumbnail`, `style` and `collection-mirror`. See
-                # portolan-spec specs/portolan/core.md, sections Assets and
-                # Single-File Collections. Portolan rebuilds each one from data
-                # the catalog still holds. An absent one must not fail a sound
-                # push (Issue #735). Conformance gaps belong to `portolan check`.
-                # Roles `data` and `source` stay a hard error, because nothing
-                # can reconstruct them.
-                if is_optional_derivative(catalog_root, href):
-                    warn(f"Optional asset not found, skipped: {href} (version {version_str})")
-                    continue
-                raise FileNotFoundError(
-                    f"Asset referenced in version {version_str} not found: {href}"
-                )
-            assets_to_upload.append(asset_path.resolve())
+            raise FileNotFoundError(f"Asset referenced in version {version_str} not found: {href}")
+        assets_to_upload.append(asset_path.resolve())
 
     # Log diffing results for user feedback (Issue #329)
     new_count = len(assets_to_upload)
@@ -646,7 +648,7 @@ def _discover_stac_files(
         root_readme = catalog_root / "README.md"
         if root_readme.exists():
             stac_files["readmes"].append(root_readme)
-        # Intermediate catalog.json / README.md for nested collections (Issue #547, #552).
+        # Intermediate catalog files for nested collections (Issue #547, #552, #905).
         # Only relevant for standalone single-collection push (include_catalog=True);
         # catalog-wide push handles these centrally after all collections succeed.
         for inter_file in _discover_intermediate_catalog_files(catalog_root, [collection]):
@@ -735,13 +737,10 @@ def _matches_exclude_pattern(path: Path, pattern: str, base_dir: Path) -> bool:
     # Directory pattern (ends with / or /*)
     # Unified handling: ".portolan/" and ".portolan/*" both mean
     # "exclude anything under a directory named .portolan"
-    if pattern.endswith("/") or pattern.endswith("/*"):
+    if pattern.endswith(("/", "/*")):
         dir_name = pattern.rstrip("/").rstrip("*").rstrip("/")
         # Check if any path component matches the directory name
-        for part in rel_path.parts:
-            if part == dir_name:
-                return True
-        return False
+        return any(part == dir_name for part in rel_path.parts)
 
     # Glob pattern (contains *)
     if "*" in pattern:
@@ -749,9 +748,7 @@ def _matches_exclude_pattern(path: Path, pattern: str, base_dir: Path) -> bool:
         if fnmatch.fnmatch(name, pattern):
             return True
         # Also match against relative path for patterns like "**/*.py"
-        if fnmatch.fnmatch(rel_str, pattern):
-            return True
-        return False
+        return bool(fnmatch.fnmatch(rel_str, pattern))
 
     # Exact match against filename
     return name == pattern
@@ -780,6 +777,11 @@ def _get_exclude_patterns(catalog_root: Path | None = None) -> list[str]:
 # Security-critical patterns that MUST always be excluded.
 # These are never overridden by user config - they are merged with user patterns.
 # Prevents accidental upload of secrets, git history, or internal state.
+# A file at or above this size uploads as a multipart transfer with chunk
+# concurrency. A smaller file uses put_async, which avoids the multipart
+# overhead.
+MULTIPART_THRESHOLD = 5 * 1024 * 1024
+
 _SECURITY_EXCLUDE_PATTERNS: frozenset[str] = frozenset(
     [
         ".env",  # Environment files with secrets
@@ -858,6 +860,164 @@ def _load_versioned_asset_paths(catalog_root: Path, collection: str) -> set[str]
         return set()
 
 
+# A file with one of these names is uploaded by its own phase, in a fixed order
+# that keeps the push atomic.
+_HANDLED_SEPARATELY = frozenset(
+    {
+        "versions.json",  # Uploaded last (manifest-last)
+        "collection.json",  # Uploaded by _upload_stac_files
+        "catalog.json",  # Uploaded by _push_all_upload_root_files
+        "README.md",  # Uploaded by _upload_readmes_async
+    }
+)
+
+
+@dataclass(frozen=True)
+class _ExcludeContext:
+    """What _should_exclude_from_push needs to judge one file.
+
+    Attributes:
+        exclude_patterns: Effective exclusion patterns, security ones included.
+        versioned_asset_paths: Asset paths versions.json already names.
+        stac_item_paths: Known STAC item JSON paths, or None to use the heuristic.
+        collection: Collection identifier, or None for a root-only discovery.
+    """
+
+    exclude_patterns: list[str]
+    versioned_asset_paths: set[str]
+    stac_item_paths: set[Path] | None
+    collection: str | None
+
+
+def _is_versioned_asset(path: Path, base_dir: Path, ctx: _ExcludeContext) -> bool:
+    """Report whether versions.json already names this file as an asset.
+
+    versions.json may store a catalog-relative path, a collection-relative path,
+    or a bare filename. The function accepts all three spellings.
+
+    Args:
+        path: Absolute path to the file.
+        base_dir: Directory the relative path is measured from.
+        ctx: Exclusion context.
+
+    Returns:
+        True when the file is a versioned asset.
+    """
+    if not ctx.versioned_asset_paths:
+        return False
+    try:
+        rel_posix = path.relative_to(base_dir).as_posix()
+    except ValueError:
+        return False
+    if rel_posix in ctx.versioned_asset_paths or path.name in ctx.versioned_asset_paths:
+        return True
+    if ctx.collection is None:
+        return False
+    return rel_posix.removeprefix(f"{ctx.collection}/") in ctx.versioned_asset_paths
+
+
+def _is_stac_item_file(path: Path, ctx: _ExcludeContext) -> bool:
+    """Report whether _discover_stac_files already found this file.
+
+    Args:
+        path: Absolute path to the file.
+        ctx: Exclusion context.
+
+    Returns:
+        True when the file is a STAC item JSON.
+    """
+    if ctx.stac_item_paths is not None:
+        return path in ctx.stac_item_paths
+    # Heuristic fallback: a STAC item lives at collection/item_dir/item_dir.json,
+    # so the JSON filename matches its parent directory name.
+    return path.suffix == ".json" and path.parent.name == path.stem
+
+
+def _should_exclude_from_push(path: Path, base_dir: Path, ctx: _ExcludeContext) -> bool:
+    """Report whether the catalog-file discovery must skip this file.
+
+    Args:
+        path: Absolute path to the file.
+        base_dir: Directory the relative path is measured from.
+        ctx: Exclusion context.
+
+    Returns:
+        True when another phase uploads the file, or a pattern excludes it.
+    """
+    if path.name in _HANDLED_SEPARATELY:
+        return True
+    if _is_versioned_asset(path, base_dir, ctx):
+        return True
+    if _is_stac_item_file(path, ctx):
+        return True
+    return any(
+        _matches_exclude_pattern(path, pattern, base_dir) for pattern in ctx.exclude_patterns
+    )
+
+
+def _discover_collection_dir_files(
+    catalog_root: Path, collection: str, ctx: _ExcludeContext
+) -> list[Path]:
+    """Walk one collection directory for files to sync.
+
+    The walk skips a symlink, because its target may sit outside the catalog.
+
+    Args:
+        catalog_root: Path to the catalog root.
+        collection: Collection identifier.
+        ctx: Exclusion context.
+
+    Returns:
+        List of absolute file paths.
+    """
+    collection_dir = catalog_root / collection
+    if not collection_dir.exists():
+        return []
+    return [
+        item
+        for item in collection_dir.rglob("*")
+        if not item.is_symlink()
+        and item.is_file()
+        and not _should_exclude_from_push(item, catalog_root, ctx)
+    ]
+
+
+def _discover_root_dir_files(catalog_root: Path, ctx: _ExcludeContext) -> list[Path]:
+    """Collect the root-level files to sync, and the logo in _assets/.
+
+    A root directory is a collection, which its own walk handles. The one
+    exception is _assets/. It holds the catalog logo the rel="icon" link points
+    at (PORTO-CORE-077). Skipping every root directory left that image behind,
+    so the published link resolved to nothing.
+
+    Args:
+        catalog_root: Path to the catalog root.
+        ctx: Exclusion context.
+
+    Returns:
+        List of absolute file paths.
+    """
+    discovered = [
+        item
+        for item in catalog_root.iterdir()
+        if not item.is_dir()
+        and not item.is_symlink()
+        and item.is_file()
+        and not _should_exclude_from_push(item, catalog_root, ctx)
+    ]
+
+    assets_dir = catalog_root / LOGO_ASSETS_DIRNAME
+    if assets_dir.is_dir() and not assets_dir.is_symlink():
+        discovered.extend(
+            item
+            for item in sorted(assets_dir.rglob("*"))
+            if not item.is_symlink()
+            and item.is_file()
+            and not _should_exclude_from_push(item, catalog_root, ctx)
+        )
+    return discovered
+
+
 def _discover_catalog_files(
     catalog_root: Path,
     collection: str | None = None,
@@ -892,104 +1052,24 @@ def _discover_catalog_files(
     Returns:
         List of absolute paths to files that should be synced.
     """
-    # Always use effective patterns which include security-critical ones
-    exclude_patterns = _get_effective_exclude_patterns(catalog_root, additional_exclude_patterns)
-
-    # Files to exclude because they're handled by other upload phases
-    # These are uploaded in specific order for atomicity
-    handled_separately = {
-        "versions.json",  # Uploaded last (manifest-last)
-        "collection.json",  # Uploaded by _upload_stac_files
-        "catalog.json",  # Uploaded by _push_all_upload_root_files
-        "README.md",  # Uploaded by _upload_readmes_async
-    }
-
-    # Load versioned asset paths from versions.json (if collection specified)
-    # These are already handled by _upload_assets_async
     versioned_asset_paths: set[str] = set()
     if collection is not None:
+        # _upload_assets_async already handles every asset versions.json names.
         versioned_asset_paths = _load_versioned_asset_paths(catalog_root, collection)
 
+    ctx = _ExcludeContext(
+        # Always use the effective patterns. They include the security ones.
+        exclude_patterns=_get_effective_exclude_patterns(catalog_root, additional_exclude_patterns),
+        versioned_asset_paths=versioned_asset_paths,
+        stac_item_paths=stac_item_paths,
+        collection=collection,
+    )
+
     discovered: list[Path] = []
-
-    def should_exclude(path: Path, base_dir: Path) -> bool:
-        """Check if a file should be excluded."""
-        # Files handled by other upload phases
-        if path.name in handled_separately:
-            return True
-
-        # Versioned assets (handled by _upload_assets_async)
-        # Check if the relative path matches any versioned asset
-        if versioned_asset_paths:
-            try:
-                rel_path = path.relative_to(base_dir)
-                rel_posix = rel_path.as_posix()
-                # Check both full relative path and just the filename
-                # (versions.json may use either format)
-                if rel_posix in versioned_asset_paths or path.name in versioned_asset_paths:
-                    return True
-                # Also check collection-relative path
-                if collection is not None:
-                    coll_rel = rel_posix.removeprefix(f"{collection}/")
-                    if coll_rel in versioned_asset_paths:
-                        return True
-            except ValueError:
-                pass
-
-        # Item STAC files (handled by _discover_stac_files)
-        if stac_item_paths is not None:
-            # Use explicit list if provided (more precise)
-            if path in stac_item_paths:
-                return True
-        else:
-            # Heuristic fallback: collection/item_dir/item_dir.json
-            # This pattern matches STAC item files where the JSON filename
-            # matches its parent directory name
-            if path.suffix == ".json" and path.parent.name == path.stem:
-                return True
-
-        # Check exclusion patterns
-        for pattern in exclude_patterns:
-            if _matches_exclude_pattern(path, pattern, base_dir):
-                return True
-
-        return False
-
-    # Walk collection directory if specified
     if collection is not None:
-        collection_dir = catalog_root / collection
-        if collection_dir.exists():
-            for item in collection_dir.rglob("*"):
-                # Skip symlinks (security: could point outside catalog)
-                if item.is_symlink():
-                    continue
-                if item.is_file() and not should_exclude(item, catalog_root):
-                    discovered.append(item)
-
-    # Optionally include catalog root files
+        discovered.extend(_discover_collection_dir_files(catalog_root, collection, ctx))
     if include_catalog_root:
-        for item in catalog_root.iterdir():
-            # Skip directories (collections are handled separately)
-            if item.is_dir():
-                continue
-            # Skip symlinks (security)
-            if item.is_symlink():
-                continue
-            if item.is_file() and not should_exclude(item, catalog_root):
-                discovered.append(item)
-
-        # `_assets/` is the one root directory that is not a collection: it holds
-        # the catalog logo the `rel="icon"` link points at (PORTO-CORE-077).
-        # Skipping every root directory left that image behind, so the published
-        # link resolved to nothing.
-        assets_dir = catalog_root / LOGO_ASSETS_DIRNAME
-        if assets_dir.is_dir() and not assets_dir.is_symlink():
-            for item in sorted(assets_dir.rglob("*")):
-                if item.is_symlink():
-                    continue
-                if item.is_file() and not should_exclude(item, catalog_root):
-                    discovered.append(item)
-
+        discovered.extend(_discover_root_dir_files(catalog_root, ctx))
     return discovered
 
 
@@ -1240,7 +1320,7 @@ def _handle_push_dry_run(
     """
     # Try to get assets, but don't fail if some are missing (dry-run should be forgiving)
     try:
-        assets = _get_assets_to_upload(catalog_root, local_data, local_versions)
+        assets = _get_assets_to_upload(catalog_root, local_data)
         asset_count = len(assets)
         asset_paths = [asset.relative_to(catalog_root) for asset in assets]
         missing_assets: list[str] = []
@@ -1268,7 +1348,7 @@ def _handle_push_dry_run(
             rel_path = f.relative_to(catalog_root)
             detail(f" {rel_path}")
 
-    # Show intermediate catalog.json / README.md for nested collections (Issue #547, #552)
+    # Show intermediate catalog files for nested collections (Issue #547, #552, #905)
     intermediate_files = _discover_intermediate_catalog_files(catalog_root, [collection])
     if intermediate_files:
         info(f"[DRY RUN] Would upload {len(intermediate_files)} intermediate catalog file(s)")
@@ -1435,16 +1515,14 @@ async def _upload_assets_async(
         json_mode: If True, suppress progress bar.
         suppress_progress: If True, suppress progress bar.
         verbose: If True, print per-file upload details.
+        adaptive: If True, raise concurrency from a slow start while the store
+            keeps up (issue #344). False holds ``concurrency`` fixed.
 
     Returns:
         Tuple of (files_uploaded, errors, uploaded_keys, metrics).
     """
     import functools
     from concurrent.futures import ThreadPoolExecutor
-
-    # Threshold for using multipart upload with chunk_concurrency
-    # Files below this use put_async (more efficient, no multipart)
-    MULTIPART_THRESHOLD = 5 * 1024 * 1024  # 5MB
 
     metrics = UploadMetrics()
 
@@ -1491,13 +1569,12 @@ async def _upload_assets_async(
                     _upload_large_file_sync, asset_path, target_key, chunk_concurrency
                 ),
             )
-        else:
-            # Small file: use put_async (more efficient, no multipart needed)
-            start = time.perf_counter()
-            content = asset_path.read_bytes()
-            await obs.put_async(store, target_key, content)
-            duration = time.perf_counter() - start
-            return target_key, size_bytes, duration
+        # Small file: use put_async (more efficient, no multipart needed)
+        start = time.perf_counter()
+        content = asset_path.read_bytes()
+        await obs.put_async(store, target_key, content)
+        duration = time.perf_counter() - start
+        return target_key, size_bytes, duration
 
     asset_strs = [str(p) for p in assets]
 
@@ -1662,36 +1739,26 @@ async def _upload_stac_files_async(
                     f"Uploaded STAC ({completed}/{total_count}): {rel_path} ({format_file_size(size)})"
                 )
 
-        # Wave 1: Upload all item STAC files in parallel
-        if item_files:
-            tasks = [upload_one(f) for f in item_files]
-            results = await asyncio.gather(*tasks)
+        async def upload_wave(files: list[Path]) -> None:
+            """Upload one wave of files in parallel and record each result."""
+            if not files:
+                return
+            results = await asyncio.gather(*[upload_one(f) for f in files])
             for i, result in enumerate(results):
-                if result:
-                    key, size = result
-                    uploaded_keys.append(key)
-                    reporter.advance(bytes_uploaded=size)
-                    log_verbose(item_files[i], size)
-
-        # Wave 2: Upload collection.json files in parallel (after items complete)
-        if collection_files:
-            tasks = [upload_one(f) for f in collection_files]
-            results = await asyncio.gather(*tasks)
-            for i, result in enumerate(results):
-                if result:
-                    key, size = result
-                    uploaded_keys.append(key)
-                    reporter.advance(bytes_uploaded=size)
-                    log_verbose(collection_files[i], size)
-
-        # Wave 3: Upload catalog.json last (manifest-last pattern)
-        for file_path in catalog_files:
-            result = await upload_one(file_path)
-            if result:
+                if result is None:
+                    continue
                 key, size = result
                 uploaded_keys.append(key)
                 reporter.advance(bytes_uploaded=size)
-                log_verbose(file_path, size)
+                log_verbose(files[i], size)
+
+        # Wave 1: every item STAC file, in parallel.
+        await upload_wave(item_files)
+        # Wave 2: collection.json, after the items complete.
+        await upload_wave(collection_files)
+        # Wave 3: catalog.json last, one file at a time (manifest-last pattern).
+        for file_path in catalog_files:
+            await upload_wave([file_path])
 
     return len(uploaded_keys), errors, uploaded_keys
 
@@ -1797,6 +1864,7 @@ async def _upload_metadata_files_async(
     collection: str,
     *,
     include_catalog_root: bool = False,
+    extra_files: list[Path] | None = None,
     concurrency: int = 50,
     verbose: bool = False,
 ) -> tuple[int, list[str]]:
@@ -1814,6 +1882,8 @@ async def _upload_metadata_files_async(
         prefix: Prefix in object storage.
         collection: Collection identifier.
         include_catalog_root: If True, include root-level metadata files.
+        extra_files: Files to upload in the same batch, such as the files of
+            the intermediate catalogs.
         concurrency: Maximum concurrent uploads.
         verbose: If True, print per-file upload details.
 
@@ -1826,6 +1896,7 @@ async def _upload_metadata_files_async(
         collection,
         include_catalog_root=include_catalog_root,
     )
+    metadata_files.extend(extra_files or [])
 
     if not metadata_files:
         return 0, []
@@ -1887,20 +1958,30 @@ async def _execute_push_uploads_async(
     This is extracted from push_async to reduce cyclomatic complexity.
 
     Args:
+        store: Object store instance the upload writes to.
+        catalog_root: Path to the catalog root directory.
+        prefix: Prefix in object storage.
+        collection: Collection identifier this push covers.
+        local_data: Local versions.json content.
+        diff: Asset differences between the local and the remote manifest.
+        etag: ETag of the remote versions.json, for the conditional write.
         concurrency: Maximum concurrent file uploads.
         chunk_concurrency: Maximum concurrent chunks per file upload.
             For files >5MB, this limits per-file multipart parallelism.
-        include_catalog: If True, upload catalog.json and root README.md.
+        json_mode: If True, suppress progress bar.
+        suppress_progress: If True, suppress progress bar.
         verbose: If True, print per-file upload details.
+        force: If True, write the manifest without the ETag precondition.
+        include_catalog: If True, upload catalog.json and root README.md.
         remote_data: Remote versions.json for sha256 diffing (Issue #329).
+        adaptive: If True, raise concurrency from a slow start while the store
+            keeps up (issue #344). False holds ``concurrency`` fixed.
 
     Returns:
         PushResult with success or failure status and metrics.
     """
     # Get assets to upload (only new/changed, per Issue #329)
-    assets = _get_assets_to_upload(
-        catalog_root, local_data, diff.local_only, remote_versions_data=remote_data
-    )
+    assets = _get_assets_to_upload(catalog_root, local_data, remote_versions_data=remote_data)
 
     # Upload assets first (async, manifest-last pattern)
     # chunk_concurrency now properly limits per-file multipart parallelism
@@ -2063,14 +2144,25 @@ async def _sync_collection_metadata_only(
     files that ``_discover_catalog_files`` finds, such as ``AGENTS.md``. Without
     it an edited agent guide never reaches the bucket.
 
+    A standalone push (``include_catalog_root``) also uploads the files of the
+    intermediate catalogs above a nested collection, such as their AGENTS.md
+    (Issue #905). A catalog-wide push leaves them to
+    ``_push_all_upload_root_files``, which uploads them once for all collections.
+
     A push with no new version and no metadata change uploads nothing.
     """
+    intermediate_files = (
+        _discover_intermediate_catalog_files(catalog_root, [collection])
+        if include_catalog_root
+        else []
+    )
     metadata_uploaded, metadata_errors = await _upload_metadata_files_async(
         store,
         catalog_root,
         prefix,
         collection,
         include_catalog_root=include_catalog_root,
+        extra_files=intermediate_files,
         concurrency=concurrency,
         verbose=verbose,
     )
@@ -2184,6 +2276,9 @@ async def push_async(
     # regenerated metadata (collection.json, catalog.json, styles) is re-uploaded
     # (Issue #496). Unchanged data assets are still skipped by the sha256 diff in
     # _get_assets_to_upload, so this refreshes metadata without a full re-push.
+    # That diff compares the local and remote current snapshots. So a force push
+    # also uploads an asset whose bytes differ from the remote current snapshot
+    # (Issue #962).
     if not force and not diff.local_only:
         return await _sync_collection_metadata_only(
             store,
@@ -2392,39 +2487,172 @@ def _discover_root_metadata_files(catalog_root: Path) -> list[Path]:
 
 
 def _discover_intermediate_catalog_files(catalog_root: Path, collections: list[str]) -> list[Path]:
-    """Discover intermediate catalog.json / README.md files for nested collections.
+    """Discover the files of each intermediate catalog for nested collections.
 
     A nested collection ``a/b/c`` has a ``catalog.json`` at each
     intermediate level (``a/``, ``a/b/``) created by ``create_intermediate_catalogs``
     during ``add``. These are neither leaf ``collection.json`` files nor the root
     ``catalog.json``, so every other push discovery path misses them (Issue #547,
     #552). This walks each collection's ancestor sub-catalog ids (shared
-    ``intermediate_catalog_ids`` helper) and returns the metadata files that
-    actually exist on disk, deduped across sibling collections and sorted for
-    deterministic output.
+    ``intermediate_catalog_ids`` helper), deduped across sibling collections and
+    sorted for deterministic output.
 
-    README.md is included only when present; ``create_intermediate_catalogs``
-    writes only ``catalog.json``, but real catalogs may carry authored READMEs at
-    sub-catalog levels (Issue #547).
+    An intermediate level follows the rule of the root level. Every file in the
+    directory is published, except the files the push exclusions skip. A fixed
+    name list missed the scaffolded AGENTS.md, which the catalog's rel="agents"
+    link names (Issue #905, #935). Subdirectories are child catalogs or
+    collections, and their own walks handle them.
 
     Args:
         catalog_root: Path to the catalog root directory.
         collections: Leaf collection ids (from ``discover_collections``).
 
     Returns:
-        Existing intermediate ``catalog.json``/``README.md`` paths, sorted.
+        Existing intermediate file paths. In each directory, ``catalog.json``
+        comes first, then ``README.md``, then the other files by name.
     """
     seen: set[str] = set()
     for collection in collections:
         seen.update(intermediate_catalog_ids(collection))
 
+    # An empty stac_item_paths turns off the item-name heuristic. A catalog
+    # level holds no items, so a file such as a/a.json is a sidecar.
+    ctx = _ExcludeContext(
+        exclude_patterns=_get_effective_exclude_patterns(catalog_root, None),
+        versioned_asset_paths=set(),
+        stac_item_paths=set(),
+        collection=None,
+    )
+
     files: list[Path] = []
     for sub in sorted(seen):
+        sub_dir = catalog_root / sub
+        # _should_exclude_from_push skips these two names, because other phases
+        # upload them at the root and collection levels. Here this phase does.
         for name in ("catalog.json", "README.md"):
-            path = catalog_root / sub / name
+            path = sub_dir / name
             if path.exists():
                 files.append(path)
+        if not sub_dir.is_dir() or sub_dir.is_symlink():
+            continue
+        files.extend(
+            item
+            for item in sorted(sub_dir.iterdir(), key=lambda p: p.name)
+            if not item.is_symlink()
+            and item.is_file()
+            and not _should_exclude_from_push(item, catalog_root, ctx)
+        )
     return files
+
+
+def _root_upload_skip_reason(
+    catalog_root: Path, catalog_json: Path, stats: dict[str, Any]
+) -> str | None:
+    """Return why the root-file upload must not run, or None to run it.
+
+    Args:
+        catalog_root: Path to the catalog root directory.
+        catalog_json: Path to the root catalog.json.
+        stats: Running push counters.
+
+    Returns:
+        A message for the user, or None when the upload may proceed.
+    """
+    if stats["failed"] > 0:
+        return "Skipping root file upload because some collections failed"
+    if stats["successful"] == 0:
+        return "Skipping root file upload because no collections were pushed"
+    if not catalog_json.exists():
+        # A missing root catalog.json means the remote root is already broken.
+        # The intermediate catalog.json files are reachable only by walking child
+        # links from this root, so they are skipped too (Issue #547, #552).
+        return f"catalog.json not found at {catalog_root} - remote catalog may be incomplete"
+    return None
+
+
+def _report_root_upload_dry_run(
+    catalog_root: Path,
+    root_metadata: list[Path],
+    intermediate_files: list[Path],
+) -> None:
+    """Print the root files a real run would upload.
+
+    Args:
+        catalog_root: Path to the catalog root directory.
+        root_metadata: Root metadata files the run would sync.
+        intermediate_files: Intermediate catalog files the run would upload.
+    """
+    if (catalog_root / "README.md").exists():
+        info("[DRY RUN] Would upload README.md")
+    if root_metadata:
+        info(f"[DRY RUN] Would sync {len(root_metadata)} root metadata file(s)")
+        for f in root_metadata:
+            detail(f" {f.relative_to(catalog_root).as_posix()}")
+    info("[DRY RUN] Would upload catalog.json")
+    if intermediate_files:
+        info(f"[DRY RUN] Would upload {len(intermediate_files)} intermediate catalog file(s)")
+        for f in intermediate_files:
+            detail(f" {f.relative_to(catalog_root).as_posix()}")
+    if (catalog_root / "versions.json").exists():
+        info("[DRY RUN] Would upload versions.json")
+
+
+def _upload_root_files(
+    store: ObjectStore,
+    prefix: str,
+    catalog_root: Path,
+    root_metadata: list[Path],
+    intermediate_files: list[Path],
+    stats: dict[str, Any],
+) -> None:
+    """Upload the root files in manifest-last order.
+
+    versions.json goes last, so a reader never sees a manifest that names a file
+    the store does not hold yet.
+
+    Args:
+        store: Object store instance.
+        prefix: Prefix in object storage.
+        catalog_root: Path to the catalog root directory.
+        root_metadata: Root metadata files to sync (Issue #426).
+        intermediate_files: Intermediate catalog files (Issue #547, #552).
+        stats: Running push counters. The function adds the file count to it.
+    """
+    root_readme = catalog_root / "README.md"
+    if root_readme.exists():
+        obs.put(store, f"{prefix}/README.md".lstrip("/"), root_readme.read_bytes())
+        success("Uploaded README.md")
+        stats["total_files"] += 1
+
+    # The key is the catalog-relative path, not the basename. `_assets/brand.png`
+    # must land under `_assets/` for the catalog's rel="icon" href to resolve. A
+    # top-level file is unaffected, because its relative path is its name.
+    for meta_file in root_metadata:
+        meta_rel = meta_file.relative_to(catalog_root).as_posix()
+        obs.put(store, f"{prefix}/{meta_rel}".lstrip("/"), meta_file.read_bytes())
+        detail(f" Synced {meta_rel}")
+        stats["total_files"] += 1
+    if root_metadata:
+        info(f"Synced {len(root_metadata)} root metadata file(s)")
+
+    catalog_json = catalog_root / "catalog.json"
+    obs.put(store, f"{prefix}/catalog.json".lstrip("/"), catalog_json.read_bytes())
+    success("Uploaded catalog.json")
+    stats["total_files"] += 1
+
+    for inter_file in intermediate_files:
+        inter_rel = inter_file.relative_to(catalog_root).as_posix()
+        obs.put(store, f"{prefix}/{inter_rel}".lstrip("/"), inter_file.read_bytes())
+        detail(f" Uploaded {inter_rel}")
+        stats["total_files"] += 1
+    if intermediate_files:
+        info(f"Uploaded {len(intermediate_files)} intermediate catalog file(s)")
+
+    root_versions = catalog_root / "versions.json"
+    if root_versions.exists():
+        obs.put(store, f"{prefix}/versions.json".lstrip("/"), root_versions.read_bytes())
+        success("Uploaded versions.json")
+        stats["total_files"] += 1
 
 
 def _push_all_upload_root_files(
@@ -2442,108 +2670,45 @@ def _push_all_upload_root_files(
     1. README.md (documentation, optional)
     2. Root metadata files (style.json, thumbnails, etc.) - Issue #426
     3. catalog.json (STAC catalog metadata, required)
-    4. Intermediate catalog.json / README.md for nested collections - Issue #547, #552
+    4. Intermediate catalog files (catalog.json, README.md, AGENTS.md, ...) - Issue #547, #552, #905
     5. versions.json (manifest, required - uploaded LAST per manifest-last atomicity)
 
     These are uploaded AFTER all collections succeed.
 
     Args:
+        catalog_root: Path to the catalog root directory.
+        destination: Object storage URL the files go to.
+        profile: Named credential profile. None uses the default credentials.
+        region: Object store region. None lets the store resolve it.
+        dry_run: If True, report the uploads and write nothing.
+        stats: Running push counters. The function reads the per-collection
+            outcome from it and adds the root-file counts to it.
         collections: Leaf collection ids (from ``discover_collections``), used to
             discover intermediate catalogs. None/empty means no intermediates.
 
     Returns True if uploads succeeded or were skipped, False if any failed.
     """
     catalog_json = catalog_root / "catalog.json"
-    root_readme = catalog_root / "README.md"
-    root_versions = catalog_root / "versions.json"
 
-    # Skip root file uploads if any collection failed
-    if stats["failed"] > 0:
-        warn("Skipping root file upload because some collections failed")
-        return True
-
-    # Also skip if no collections succeeded (nothing to manifest)
-    if stats["successful"] == 0:
-        warn("Skipping root file upload because no collections were pushed")
-        return True
-
-    if not catalog_json.exists():
-        # No root catalog.json means the remote root is already broken, so we do
-        # not bother with intermediate catalog.json either (Issue #547, #552) -
-        # they are only reachable by walking child links from this missing root.
-        warn(f"catalog.json not found at {catalog_root} - remote catalog may be incomplete")
+    skip_reason = _root_upload_skip_reason(catalog_root, catalog_json, stats)
+    if skip_reason is not None:
+        warn(skip_reason)
         return True
 
     # Discover root metadata files (Issue #426)
     root_metadata = _discover_root_metadata_files(catalog_root)
 
-    # Discover intermediate catalog.json / README.md for nested collections
+    # Discover intermediate catalog files for nested collections (Issue #905)
     # (Issue #547, #552). Uploaded after root catalog.json, before versions.json.
     intermediate_files = _discover_intermediate_catalog_files(catalog_root, collections or [])
 
     if dry_run:
-        if root_readme.exists():
-            info("[DRY RUN] Would upload README.md")
-        if root_metadata:
-            info(f"[DRY RUN] Would sync {len(root_metadata)} root metadata file(s)")
-            for f in root_metadata:
-                detail(f" {f.relative_to(catalog_root).as_posix()}")
-        info("[DRY RUN] Would upload catalog.json")
-        if intermediate_files:
-            info(f"[DRY RUN] Would upload {len(intermediate_files)} intermediate catalog file(s)")
-            for f in intermediate_files:
-                detail(f" {f.relative_to(catalog_root).as_posix()}")
-        if root_versions.exists():
-            info("[DRY RUN] Would upload versions.json")
+        _report_root_upload_dry_run(catalog_root, root_metadata, intermediate_files)
         return True
 
     try:
         store, prefix = setup_store(destination, profile=profile, region=region)
-
-        # Upload README.md first (documentation, not critical)
-        if root_readme.exists():
-            readme_key = f"{prefix}/README.md".lstrip("/")
-            obs.put(store, readme_key, root_readme.read_bytes())
-            success("Uploaded README.md")
-            stats["total_files"] += 1
-
-        # Upload root metadata files (Issue #426). The key is the catalog-relative
-        # path, not the basename: `_assets/brand.png` must land under `_assets/`
-        # for the catalog's rel="icon" href to resolve. Top-level files are
-        # unaffected, their relative path is their name.
-        for meta_file in root_metadata:
-            meta_rel = meta_file.relative_to(catalog_root).as_posix()
-            meta_key = f"{prefix}/{meta_rel}".lstrip("/")
-            obs.put(store, meta_key, meta_file.read_bytes())
-            detail(f" Synced {meta_rel}")
-            stats["total_files"] += 1
-
-        if root_metadata:
-            info(f"Synced {len(root_metadata)} root metadata file(s)")
-
-        # Upload catalog.json (STAC metadata)
-        catalog_key = f"{prefix}/catalog.json".lstrip("/")
-        obs.put(store, catalog_key, catalog_json.read_bytes())
-        success("Uploaded catalog.json")
-        stats["total_files"] += 1
-
-        # Upload intermediate catalog.json / README.md for nested collections
-        # (Issue #547, #552) - before versions.json to preserve manifest-last.
-        for inter_file in intermediate_files:
-            inter_key = f"{prefix}/{inter_file.relative_to(catalog_root).as_posix()}".lstrip("/")
-            obs.put(store, inter_key, inter_file.read_bytes())
-            detail(f" Uploaded {inter_file.relative_to(catalog_root).as_posix()}")
-            stats["total_files"] += 1
-        if intermediate_files:
-            info(f"Uploaded {len(intermediate_files)} intermediate catalog file(s)")
-
-        # Upload versions.json LAST (manifest-last atomicity)
-        if root_versions.exists():
-            versions_key = f"{prefix}/versions.json".lstrip("/")
-            obs.put(store, versions_key, root_versions.read_bytes())
-            success("Uploaded versions.json")
-            stats["total_files"] += 1
-
+        _upload_root_files(store, prefix, catalog_root, root_metadata, intermediate_files, stats)
         return True
     except Exception as e:
         error(f"Failed to upload root files: {e}")

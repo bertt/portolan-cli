@@ -16,11 +16,28 @@ Typical usage:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
+
+from portolan_cli.extract.arcgis.imageserver.tilecache import (
+    TileCacheInfo,
+    export_image_supported,
+    parse_tile_info,
+)
+
+logger = logging.getLogger(__name__)
+
+# ArcGIS Server defaults for the "Max Image Height" and "Max Image Width"
+# service properties. Hosted tiled imagery layers on ArcGIS Online omit the
+# maxImageHeight and maxImageWidth fields from the service JSON (issue #870).
+# Discovery applies these defaults when a field is absent, so the tile size
+# check in the extractor still has a limit to compare against.
+DEFAULT_MAX_IMAGE_HEIGHT = 4100
+DEFAULT_MAX_IMAGE_WIDTH = 15000
 
 
 class ImageServerDiscoveryError(Exception):
@@ -32,8 +49,6 @@ class ImageServerDiscoveryError(Exception):
     - Required fields are missing from response
     - ArcGIS returns an error response (e.g., authentication required)
     """
-
-    pass
 
 
 @dataclass
@@ -54,8 +69,10 @@ class ImageServerMetadata:
         pixel_size_y: Pixel height in the service's coordinate system units
         full_extent: Bounding box with spatial reference
             {xmin, ymin, xmax, ymax, spatialReference: {wkid, latestWkid?}}
-        max_image_width: Maximum image width that can be requested
-        max_image_height: Maximum image height that can be requested
+        max_image_width: Maximum image width that can be requested. Falls
+            back to DEFAULT_MAX_IMAGE_WIDTH when the service omits the field.
+        max_image_height: Maximum image height that can be requested. Falls
+            back to DEFAULT_MAX_IMAGE_HEIGHT when the service omits the field.
         capabilities: List of service capabilities (e.g., Image, Metadata, Catalog)
         description: Optional service description
         copyright_text: Optional copyright information (maps to attribution)
@@ -67,6 +84,9 @@ class ImageServerMetadata:
         keywords: Keywords from documentInfo (comma-separated list)
         license_info: License text from licenseInfo
         access_information: Access restrictions from accessInformation (known_issues)
+        tile_cache: Tile cache grid from tileInfo, or None when the service
+            publishes no cache. A hosted tiled imagery layer serves only this
+            cache (issue #870).
     """
 
     name: str
@@ -87,6 +107,20 @@ class ImageServerMetadata:
     keywords: list[str] | None = None
     license_info: str | None = None
     access_information: str | None = None
+    tile_cache: TileCacheInfo | None = None
+
+    @property
+    def export_image_supported(self) -> bool:
+        """Report whether the service accepts exportImage requests.
+
+        A service that lists the TilesOnly capability answers exportImage with
+        HTTP 400 at every size. The extractor reads its cache instead
+        (issue #870).
+
+        Returns:
+            False when the service is cache-only, True otherwise.
+        """
+        return export_image_supported(self.capabilities)
 
     def get_crs_string(self) -> str:
         """Get CRS as EPSG string from spatial reference.
@@ -207,7 +241,7 @@ async def _fetch_json(url: str, timeout: float) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(request_url)
             response.raise_for_status()
-            return cast(dict[str, Any], response.json())
+            return cast("dict[str, Any]", response.json())
     except httpx.HTTPStatusError as e:
         msg = f"Failed to fetch from {url}: HTTP {e.response.status_code}"
         raise ImageServerDiscoveryError(msg) from e
@@ -225,7 +259,7 @@ async def _fetch_json(url: str, timeout: float) -> dict[str, Any]:
         raise ImageServerDiscoveryError(msg) from e
 
 
-def _check_arcgis_error(data: dict[str, Any], url: str) -> None:
+def _check_arcgis_error(data: dict[str, Any]) -> None:
     """Check for ArcGIS error response and raise if found.
 
     ArcGIS returns errors as JSON with an 'error' key containing
@@ -233,7 +267,6 @@ def _check_arcgis_error(data: dict[str, Any], url: str) -> None:
 
     Args:
         data: Parsed JSON response
-        url: Original URL (for error message)
 
     Raises:
         ImageServerDiscoveryError: If response contains an error
@@ -262,8 +295,6 @@ def _validate_required_fields(data: dict[str, Any], url: str) -> None:
         "pixelSizeX",
         "pixelSizeY",
         "extent",
-        "maxImageHeight",
-        "maxImageWidth",
     ]
 
     for field_name in required_fields:
@@ -271,6 +302,28 @@ def _validate_required_fields(data: dict[str, Any], url: str) -> None:
             raise ImageServerDiscoveryError(
                 f"Missing required field '{field_name}' in ImageServer response from {url}"
             )
+
+
+def _image_size_limit(data: dict[str, Any], field_name: str, default: int) -> int:
+    """Read an optional image size limit, with the ArcGIS Server default.
+
+    Args:
+        data: Parsed JSON response
+        field_name: "maxImageWidth" or "maxImageHeight"
+        default: Value to use when the field is absent or empty
+
+    Returns:
+        The limit from the response, or the default
+    """
+    value = data.get(field_name)
+    if not value:
+        logger.warning(
+            "ImageServer response omits '%s'. Using the ArcGIS Server default of %d px.",
+            field_name,
+            default,
+        )
+        return default
+    return int(value)
 
 
 def parse_imageserver_response(data: dict[str, Any]) -> ImageServerMetadata:
@@ -291,7 +344,7 @@ def parse_imageserver_response(data: dict[str, Any]) -> ImageServerMetadata:
             response contains an error
     """
     # Check for ArcGIS error response
-    _check_arcgis_error(data, "<parsed response>")
+    _check_arcgis_error(data)
 
     # Validate required fields
     _validate_required_fields(data, "<parsed response>")
@@ -319,8 +372,8 @@ def parse_imageserver_response(data: dict[str, Any]) -> ImageServerMetadata:
         pixel_size_x=float(data["pixelSizeX"]),
         pixel_size_y=float(data["pixelSizeY"]),
         full_extent=data["extent"],
-        max_image_width=data["maxImageWidth"],
-        max_image_height=data["maxImageHeight"],
+        max_image_width=_image_size_limit(data, "maxImageWidth", DEFAULT_MAX_IMAGE_WIDTH),
+        max_image_height=_image_size_limit(data, "maxImageHeight", DEFAULT_MAX_IMAGE_HEIGHT),
         capabilities=capabilities,
         description=data.get("description"),
         copyright_text=data.get("copyrightText"),
@@ -331,6 +384,7 @@ def parse_imageserver_response(data: dict[str, Any]) -> ImageServerMetadata:
         keywords=keywords,
         license_info=data.get("licenseInfo"),
         access_information=data.get("accessInformation"),
+        tile_cache=parse_tile_info(data),
     )
 
 

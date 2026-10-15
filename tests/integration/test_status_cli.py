@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from click.testing import CliRunner
 
 from portolan_cli.cli import cli
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
@@ -51,6 +54,11 @@ def initialized_catalog(tmp_path: Path) -> Path:
         ],
     }
     (collection / "versions.json").write_text(json.dumps(versions_data))
+
+    # status finds collections by their collection.json, as check does (#944)
+    (collection / "collection.json").write_text(
+        json.dumps({"type": "Collection", "id": "demographics", "links": []})
+    )
 
     return tmp_path
 

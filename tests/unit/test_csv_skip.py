@@ -23,14 +23,15 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from portolan_cli import errors
 from portolan_cli.add import (
     _copy_non_geo_to_item_dir,
-    _is_no_geometry_error,
     _update_item_with_asset,
     add_files,
     iter_files_with_sidecars,
 )
 from portolan_cli.constants import GEOSPATIAL_EXTENSIONS, TABULAR_EXTENSIONS
+from tests.unit.add_stubs import add_mixed_directory_without_raising, write_point_geojson
 
 
 @pytest.fixture
@@ -316,15 +317,19 @@ class TestCsvGeometryDetection:
         empty_csv.write_text("")
 
         with caplog.at_level(logging.WARNING):
-            try:
-                added, skipped, failures = add_files(
-                    paths=[empty_csv],
-                    catalog_root=initialized_catalog,
-                    collection_id="collection",
-                )
-            except Exception:
-                # If it errors, that's also acceptable for empty files
-                pass
+            added, skipped, failures = add_files(
+                paths=[empty_csv],
+                catalog_root=initialized_catalog,
+                collection_id="collection",
+            )
+
+        # An empty CSV carries no geometry, so the default configuration
+        # reports it as a failure instead of raising.
+        assert added == []
+        assert skipped == []
+        assert len(failures) == 1
+        assert failures[0].path == empty_csv
+        assert "Tabular data support is disabled" in failures[0].error
 
     @pytest.mark.unit
     def test_csv_with_wkt_geometry_is_processed(
@@ -431,7 +436,9 @@ csv_safe_values = st.text(
 class TestCsvSkipHypothesis:
     """Hypothesis property-based tests for CSV skip logic."""
 
-    @pytest.mark.unit
+    # integration: each example runs add_files, which reads the CSV with
+    # geoparquet-io and DuckDB. That read is the path this property checks.
+    @pytest.mark.integration
     @given(
         num_columns=st.integers(min_value=2, max_value=5),
         num_rows=st.integers(min_value=1, max_value=5),
@@ -521,44 +528,16 @@ class TestCsvSkipHypothesis:
             geojson_paths = []
             for i in range(num_geo_files):
                 geojson_file = collection_dir / f"geo_{i}.geojson"
-                geojson_data = {
-                    "type": "FeatureCollection",
-                    "features": [
-                        {
-                            "type": "Feature",
-                            "geometry": {"type": "Point", "coordinates": [-122.4 + i, 37.8]},
-                            "properties": {"name": f"Point {i}"},
-                        }
-                    ],
-                }
-                geojson_file.write_text(json.dumps(geojson_data))
+                write_point_geojson(geojson_file, i)
                 geojson_paths.append(geojson_file)
 
-            # Mock prepare_item and finalize_items to track calls
-            # Per Issue #281: add_files now calls prepare_item + finalize_items
-            with (
-                patch("portolan_cli.add.prepare_item") as mock_add,
-                patch("portolan_cli.add.finalize_items") as mock_finalize,
-            ):
-                mock_add.return_value = MagicMock(item_id="test", collection_id="collection")
-                mock_finalize.return_value = []
-
-                # This should NOT raise
-                try:
-                    added, skipped, failures = add_files(
-                        paths=[collection_dir],
-                        catalog_root=tmp_path,
-                        collection_id="collection",
-                    )
-                except Exception as e:
-                    pytest.fail(f"add_files raised for mixed directory: {e}")
-
-                # Should have attempted to add all geo files
-                # (actual count may differ due to mocking behavior)
+            add_mixed_directory_without_raising(collection_dir, tmp_path, "test")
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    @pytest.mark.unit
+    # integration: each example runs add_files, which reads the CSV with
+    # geoparquet-io and DuckDB.
+    @pytest.mark.integration
     @given(
         csv_rows=st.lists(
             st.tuples(
@@ -710,35 +689,6 @@ class TestTsvSupport:
 
 class TestExceptionHandlingNarrowness:
     """Tests for narrow exception handling (adversarial review issue #1)."""
-
-    @pytest.mark.unit
-    def test_is_no_geometry_error_detects_geometry_error(self) -> None:
-        """_is_no_geometry_error should detect geoparquet-io geometry errors."""
-        # Create mock errors that match geoparquet-io patterns
-        geometry_errors = [
-            click.ClickException("Could not detect geometry columns in CSV/TSV file"),
-            click.ClickException("Reading failed: Could not detect geometry columns"),
-            click.ClickException("No geometry columns in csv file"),
-            click.ClickException("No geometry columns in tsv file"),
-        ]
-
-        for err in geometry_errors:
-            assert _is_no_geometry_error(err), f"Should detect as geometry error: {err.message}"
-
-    @pytest.mark.unit
-    def test_is_no_geometry_error_rejects_other_errors(self) -> None:
-        """_is_no_geometry_error should NOT match non-geometry errors."""
-        # These are errors that should NOT be caught as geometry errors
-        other_errors = [
-            click.ClickException("Permission denied: /path/to/file"),
-            click.ClickException("File not found: data.csv"),
-            click.ClickException("Memory allocation failed"),
-            click.ClickException("Invalid encoding: UTF-16"),
-            click.ClickException("Connection timeout"),
-        ]
-
-        for err in other_errors:
-            assert not _is_no_geometry_error(err), f"Should NOT be geometry error: {err.message}"
 
     @pytest.mark.unit
     def test_non_geometry_click_exception_propagates(
@@ -928,7 +878,6 @@ class TestCopyNonGeoToItemDir:
     @pytest.mark.unit
     def test_preserves_file_metadata(self, tmp_path: Path) -> None:
         """_copy_non_geo_to_item_dir should preserve file metadata (uses copy2)."""
-        import os
         import time
 
         # Create source file with specific content
@@ -938,7 +887,7 @@ class TestCopyNonGeoToItemDir:
         source_file.write_text("name,value\ntest,100\n")
 
         # Get original mtime
-        original_mtime = os.path.getmtime(source_file)
+        original_mtime = Path(source_file).stat().st_mtime
 
         # Wait a bit to ensure time difference
         time.sleep(0.1)
@@ -951,7 +900,7 @@ class TestCopyNonGeoToItemDir:
         result = _copy_non_geo_to_item_dir(source_file, item_dir)
 
         # mtime should be preserved (within tolerance)
-        copied_mtime = os.path.getmtime(result)
+        copied_mtime = Path(result).stat().st_mtime
         assert abs(copied_mtime - original_mtime) < 1.0, "File metadata not preserved"
 
 
@@ -1026,7 +975,6 @@ class TestUpdateItemWithAsset:
             catalog_root=catalog_root,
             collection_id=collection_id,
             item_id=item_id,
-            asset_path=new_asset,
         )
 
         # Verify item.json was updated
@@ -1056,7 +1004,6 @@ class TestUpdateItemWithAsset:
                 catalog_root=catalog_root,
                 collection_id=collection_id,
                 item_id=item_id,
-                asset_path=asset_path,
             )
 
         # Should log warning about missing item.json
@@ -1096,7 +1043,6 @@ class TestUpdateItemWithAsset:
                 catalog_root=catalog_root,
                 collection_id=collection_id,
                 item_id=item_id,
-                asset_path=item_dir / "metadata.csv",
             )
 
         # Should log warning about no primary file
@@ -1248,17 +1194,19 @@ class TestAddFilesCodePaths:
             )
         )
 
-        with patch("portolan_cli.add.prepare_item") as mock_add:
-            with patch("portolan_cli.add.is_current", return_value=True):
-                added, skipped, failures = add_files(
-                    paths=[geojson],
-                    catalog_root=initialized_catalog,
-                    collection_id="collection",
-                )
+        with (
+            patch("portolan_cli.add.prepare_item") as mock_add,
+            patch("portolan_cli.add.is_current", return_value=True),
+        ):
+            added, skipped, failures = add_files(
+                paths=[geojson],
+                catalog_root=initialized_catalog,
+                collection_id="collection",
+            )
 
-                # Should NOT call add for unchanged files
-                assert not mock_add.called
-                assert geojson in skipped
+            # Should NOT call add for unchanged files
+            assert not mock_add.called
+            assert geojson in skipped
 
     @pytest.mark.unit
     def test_collection_id_resolution(self, initialized_catalog: Path, tmp_path: Path) -> None:
@@ -1287,23 +1235,23 @@ class TestAddFilesCodePaths:
         with (
             patch("portolan_cli.add.prepare_item") as mock_add,
             patch("portolan_cli.add.finalize_items") as mock_finalize,
-        ):
-            with patch(
+            patch(
                 "portolan_cli.add.infer_nested_collection_id",
                 return_value="my-collection",
-            ) as mock_infer:
-                mock_add.return_value = MagicMock(item_id="data", collection_id="my-collection")
-                mock_finalize.return_value = []
+            ) as mock_infer,
+        ):
+            mock_add.return_value = MagicMock(item_id="data", collection_id="my-collection")
+            mock_finalize.return_value = []
 
-                # Don't pass collection_id - should be inferred
-                added, skipped, failures = add_files(
-                    paths=[geojson],
-                    catalog_root=initialized_catalog,
-                    collection_id=None,
-                )
+            # Don't pass collection_id - should be inferred
+            added, skipped, failures = add_files(
+                paths=[geojson],
+                catalog_root=initialized_catalog,
+                collection_id=None,
+            )
 
-                # Should have inferred collection_id using nested inference
-                mock_infer.assert_called_once()
+            # Should have inferred collection_id using nested inference
+            mock_infer.assert_called_once()
 
     @pytest.mark.unit
     def test_deferred_non_geo_processing_with_geo_file(
@@ -1398,11 +1346,10 @@ class TestAddFilesCodePaths:
             """Simulate add: success for geojson, geometry error for csv."""
             if path.suffix.lower() == ".geojson":
                 return MagicMock(item_id="data", collection_id="collection")
-            elif path.suffix.lower() == ".csv":
-                raise click.ClickException("Could not detect geometry columns in CSV file")
-            else:
-                # Skip other files (like parquet) - they shouldn't be in source_dir
-                raise ValueError(f"Unexpected file type: {path}")
+            if path.suffix.lower() == ".csv":
+                raise errors.NoGeometryError(str(path), "No geometry columns.")
+            # Skip other files (like parquet) - they shouldn't be in source_dir
+            raise ValueError(f"Unexpected file type: {path}")
 
         # Per Issue #281: add_files now calls prepare_item + finalize_items
         with (
@@ -1441,7 +1388,7 @@ class TestAddFilesCodePaths:
 
         with patch("portolan_cli.add.prepare_item") as mock_add:
             # Simulate geometry detection error for a non-tabular format
-            mock_add.side_effect = click.ClickException("Could not detect geometry columns in file")
+            mock_add.side_effect = errors.NoGeometryError(str(geojson), "No geometry columns.")
 
             # Per Issue #175: errors are now collected instead of raised
             added, skipped, failures = add_files(

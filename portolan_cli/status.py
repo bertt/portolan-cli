@@ -10,11 +10,16 @@ Provides git-like status output showing:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from portolan_cli.constants import MANAGED_FILES
+from portolan_cli.stac_links import catalog_collections, versioned_collections
 from portolan_cli.sync.checksums import compute_checksum
 from portolan_cli.versions import VersionsFile, read_versions
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
 
 
 @dataclass
@@ -63,10 +68,9 @@ class CollectionStatus:
 
         if local_parts > remote_parts:
             return "ahead"
-        elif local_parts < remote_parts:
+        if local_parts < remote_parts:
             return "behind"
-        else:
-            return "diverged"
+        return "diverged"
 
     @staticmethod
     def _parse_version(version: str) -> tuple[int, int, int]:
@@ -158,16 +162,20 @@ def detect_deleted_files(
     return sorted(deleted)
 
 
-# Files managed by Portolan that should not appear as "untracked"
-MANAGED_FILES = frozenset(
-    {
-        "versions.json",
-        "collection.json",
-        "catalog.json",
-        "README.md",
-        "metadata.yaml",
-    }
-)
+def status_collections(catalog_root: Path) -> list[str]:
+    """The collections ``status`` reports: the ``check`` set and the ``push`` set.
+
+    ``check`` finds a collection by its ``collection.json``. ``push`` finds it by
+    its ``versions.json``. ``status`` previews ``push`` and must agree with
+    ``check``, so it reports both sets (issue #944).
+
+    Args:
+        catalog_root: Root directory of the catalog.
+
+    Returns:
+        Sorted collection IDs with forward slashes on every platform.
+    """
+    return sorted({*catalog_collections(catalog_root), *versioned_collections(catalog_root)})
 
 
 def _is_stac_item(file_path: Path) -> bool:
@@ -233,6 +241,7 @@ def get_collection_status(
     *,
     offline: bool = False,
     remote_url: str | None = None,
+    fetch_remote_versions: Callable[[str, str], VersionsFile] | None = None,
 ) -> CollectionStatus:
     """Get status for a single collection.
 
@@ -241,6 +250,12 @@ def get_collection_status(
         collection: Collection ID/path relative to catalog root.
         offline: If True, skip remote version check.
         remote_url: Optional remote URL for fetching remote versions.json.
+        fetch_remote_versions: Reads the remote versions.json for
+            ``(remote_url, collection)``. The remote check runs only when the
+            caller passes both this and ``remote_url``. The caller supplies it
+            because the remote readers load Click and the write modules, and
+            this module must not (issue #944). The CLI passes
+            ``portolan_cli.sync.pull.fetch_remote_versions``.
 
     Returns:
         CollectionStatus with local/remote versions and file changes.
@@ -271,8 +286,8 @@ def get_collection_status(
 
     # Fetch remote version (unless offline)
     remote_version: str | None = None
-    if not offline and remote_url:
-        remote_version = _fetch_remote_version(remote_url, collection)
+    if not offline and remote_url and fetch_remote_versions is not None:
+        remote_version = _fetch_remote_version(remote_url, collection, fetch_remote_versions)
 
     return CollectionStatus(
         collection=collection,
@@ -284,22 +299,22 @@ def get_collection_status(
     )
 
 
-def _fetch_remote_version(remote_url: str, collection: str) -> str | None:
+def _fetch_remote_version(
+    remote_url: str,
+    collection: str,
+    fetch_remote_versions: Callable[[str, str], VersionsFile],
+) -> str | None:
     """Fetch current version from remote versions.json.
 
     Args:
         remote_url: Base URL of remote catalog.
         collection: Collection ID.
+        fetch_remote_versions: Reads the remote versions.json.
 
     Returns:
         Remote version string, or None if fetch fails.
     """
-    # Import here to avoid circular dependency
-    from portolan_cli.sync.pull import PullError, _fetch_remote_versions
-
     try:
-        # Reuse existing remote fetch logic
-        remote_versions = _fetch_remote_versions(remote_url, collection)
-        return remote_versions.current_version
-    except (PullError, Exception):
+        return fetch_remote_versions(remote_url, collection).current_version
+    except Exception:
         return None

@@ -9,13 +9,9 @@ Tests the partitioning functionality including:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest import mock
 
 import pytest
-
-if TYPE_CHECKING:
-    pass
 
 
 class TestShouldPartition:
@@ -362,16 +358,18 @@ class TestPartitioningRollback:
         def failing_partition(*args: object, **kwargs: object) -> None:
             raise RuntimeError("Simulated partition failure")
 
-        with mock.patch(
-            "geoparquet_io.core.partition.by_kdtree.partition_by_kdtree",
-            failing_partition,
+        with (
+            mock.patch(
+                "geoparquet_io.core.partition.by_kdtree.partition_by_kdtree",
+                failing_partition,
+            ),
+            pytest.raises(RuntimeError, match="Simulated partition failure"),
         ):
-            with pytest.raises(RuntimeError, match="Simulated partition failure"):
-                partition_geoparquet(
-                    input_path=input_file,
-                    output_dir=output_dir,
-                    strategy="kdtree",
-                )
+            partition_geoparquet(
+                input_path=input_file,
+                output_dir=output_dir,
+                strategy="kdtree",
+            )
 
         # Partial directories should be cleaned up
         assert not partial_dir.exists()
@@ -613,7 +611,6 @@ class TestFinalizeItemPartitionWiring:
         import pystac
 
         from portolan_cli.add import PreparedItem, finalize_items
-        from portolan_cli.formats import FormatType
         from portolan_cli.stac import EXTENSION_URLS
 
         # Initialize catalog structure
@@ -641,7 +638,7 @@ class TestFinalizeItemPartitionWiring:
         prepared = PreparedItem(
             item_id="test_partitioned",
             collection_id="test-collection",
-            format_type=FormatType.VECTOR,
+            format_type="vector",
             bbox=[-180, -90, 180, 90],
             asset_files={},
             item_json_path=None,

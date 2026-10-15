@@ -18,7 +18,6 @@ Test categories:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,8 +29,7 @@ from portolan_cli.sync.push import UploadMetrics
 from tests.conftest import cleared_environ
 
 if TYPE_CHECKING:
-    pass
-
+    from pathlib import Path
 
 # =============================================================================
 # Test fixtures
@@ -705,13 +703,15 @@ class TestEtagOptimisticLocking:
                             "Remote changed during push, re-run push to try again"
                         )
 
-                        with patch("portolan_cli.sync.push._cleanup_uploaded_assets"):
-                            with pytest.raises(PushConflictError) as exc_info:
-                                push(
-                                    catalog_root=local_catalog,
-                                    collection="test",
-                                    destination="s3://mybucket/catalog",
-                                )
+                        with (
+                            patch("portolan_cli.sync.push._cleanup_uploaded_assets"),
+                            pytest.raises(PushConflictError) as exc_info,
+                        ):
+                            push(
+                                catalog_root=local_catalog,
+                                collection="test",
+                                destination="s3://mybucket/catalog",
+                            )
 
                         assert "Remote changed during push" in str(exc_info.value)
 
@@ -741,33 +741,35 @@ class TestManifestLastOrdering:
 
         def track_versions(*args, **kwargs):
             call_order.append("versions")
-            return None
+            return
 
         with patch(
             "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = (None, None)
 
-            with patch(
-                "portolan_cli.sync.push._upload_assets_async",
-                new_callable=AsyncMock,
-                side_effect=track_assets,
-            ):
-                with patch(
+            with (
+                patch(
+                    "portolan_cli.sync.push._upload_assets_async",
+                    new_callable=AsyncMock,
+                    side_effect=track_assets,
+                ),
+                patch(
                     "portolan_cli.sync.push._upload_stac_files_async",
                     new_callable=AsyncMock,
                     side_effect=track_stac,
-                ):
-                    with patch(
-                        "portolan_cli.sync.push._upload_versions_json_async",
-                        new_callable=AsyncMock,
-                        side_effect=track_versions,
-                    ):
-                        push(
-                            catalog_root=local_catalog,
-                            collection="test",
-                            destination="s3://mybucket/catalog",
-                        )
+                ),
+                patch(
+                    "portolan_cli.sync.push._upload_versions_json_async",
+                    new_callable=AsyncMock,
+                    side_effect=track_versions,
+                ),
+            ):
+                push(
+                    catalog_root=local_catalog,
+                    collection="test",
+                    destination="s3://mybucket/catalog",
+                )
 
         assert call_order == ["assets", "stac", "versions"], (
             f"Expected assets -> stac -> versions, got: {call_order}"
@@ -883,7 +885,6 @@ class TestMissingAssetDetection:
             _get_assets_to_upload(
                 catalog_root=local_catalog,
                 versions_data=versions_data,
-                versions_to_push=["1.0.0"],
             )
 
 
@@ -939,7 +940,6 @@ class TestMissingDerivedAsset:
                     "derived": missing_href,
                 }
             ),
-            versions_to_push=["1.0.0"],
         )
 
         assert assets == [source.resolve()]
@@ -954,7 +954,6 @@ class TestMissingDerivedAsset:
             _get_assets_to_upload(
                 catalog_root=local_catalog,
                 versions_data=self._versions_data({"scene1/scene1.tif": "test/scene1/scene1.tif"}),
-                versions_to_push=["1.0.0"],
             )
 
     @staticmethod
@@ -987,7 +986,6 @@ class TestMissingDerivedAsset:
             _get_assets_to_upload(
                 catalog_root=local_catalog,
                 versions_data=self._versions_data({"data.pmtiles": "test/data.pmtiles"}),
-                versions_to_push=["1.0.0"],
             )
 
     @pytest.mark.unit
@@ -1002,7 +1000,6 @@ class TestMissingDerivedAsset:
         assets = _get_assets_to_upload(
             catalog_root=local_catalog,
             versions_data=self._versions_data({"preview.webp": "test/preview.webp"}),
-            versions_to_push=["1.0.0"],
         )
 
         assert assets == []
@@ -1019,7 +1016,6 @@ class TestMissingDerivedAsset:
             _get_assets_to_upload(
                 catalog_root=local_catalog,
                 versions_data=self._versions_data({"original.gpkg": "test/original.gpkg"}),
-                versions_to_push=["1.0.0"],
             )
 
     @pytest.mark.unit
@@ -1036,7 +1032,6 @@ class TestMissingDerivedAsset:
             _get_assets_to_upload(
                 catalog_root=local_catalog,
                 versions_data=self._versions_data({"thumbnail.png": "test/thumbnail.png"}),
-                versions_to_push=["1.0.0"],
             )
 
 
@@ -1498,15 +1493,17 @@ class TestOrphanCleanup:
                     ) as mock_upload_versions:
                         mock_upload_versions.side_effect = PushConflictError("Etag mismatch")
 
-                        with patch(
-                            "portolan_cli.sync.push._cleanup_uploaded_assets"
-                        ) as mock_cleanup:
-                            with pytest.raises(PushConflictError):
-                                push(
-                                    catalog_root=local_catalog,
-                                    collection="test",
-                                    destination="s3://mybucket/catalog",
-                                )
+                        with (
+                            patch(
+                                "portolan_cli.sync.push._cleanup_uploaded_assets"
+                            ) as mock_cleanup,
+                            pytest.raises(PushConflictError),
+                        ):
+                            push(
+                                catalog_root=local_catalog,
+                                collection="test",
+                                destination="s3://mybucket/catalog",
+                            )
 
         mock_cleanup.assert_called_once()
 
@@ -1606,15 +1603,17 @@ class TestMultiCloudStoreSetup:
         """setup_store should use AWS credentials from environment."""
         from portolan_cli.sync.upload import setup_store
 
-        with cleared_environ(
-            AWS_ACCESS_KEY_ID="env_access_key",
-            AWS_SECRET_ACCESS_KEY="env_secret_key",
-            AWS_REGION="eu-west-1",
+        with (
+            cleared_environ(
+                AWS_ACCESS_KEY_ID="env_access_key",
+                AWS_SECRET_ACCESS_KEY="env_secret_key",
+                AWS_REGION="eu-west-1",
+            ),
+            patch("portolan_cli.sync.upload.S3Store") as mock_s3,
         ):
-            with patch("portolan_cli.sync.upload.S3Store") as mock_s3:
-                mock_s3.return_value = MagicMock()
+            mock_s3.return_value = MagicMock()
 
-                store, prefix = setup_store("s3://mybucket/prefix")
+            store, prefix = setup_store("s3://mybucket/prefix")
 
         mock_s3.assert_called_once_with(
             "mybucket",
@@ -1628,15 +1627,17 @@ class TestMultiCloudStoreSetup:
         """setup_store should fallback to AWS_DEFAULT_REGION if AWS_REGION not set."""
         from portolan_cli.sync.upload import setup_store
 
-        with cleared_environ(
-            AWS_ACCESS_KEY_ID="key",
-            AWS_SECRET_ACCESS_KEY="secret",
-            AWS_DEFAULT_REGION="ap-southeast-1",
+        with (
+            cleared_environ(
+                AWS_ACCESS_KEY_ID="key",
+                AWS_SECRET_ACCESS_KEY="secret",
+                AWS_DEFAULT_REGION="ap-southeast-1",
+            ),
+            patch("portolan_cli.sync.upload.S3Store") as mock_s3,
         ):
-            with patch("portolan_cli.sync.upload.S3Store") as mock_s3:
-                mock_s3.return_value = MagicMock()
+            mock_s3.return_value = MagicMock()
 
-                setup_store("s3://mybucket/prefix")
+            setup_store("s3://mybucket/prefix")
 
         call_kwargs = mock_s3.call_args[1]
         assert call_kwargs["region"] == "ap-southeast-1"
@@ -1646,14 +1647,16 @@ class TestMultiCloudStoreSetup:
         """setup_store should work without region (uses AWS SDK defaults)."""
         from portolan_cli.sync.upload import setup_store
 
-        with cleared_environ(
-            AWS_ACCESS_KEY_ID="key",
-            AWS_SECRET_ACCESS_KEY="secret",
+        with (
+            cleared_environ(
+                AWS_ACCESS_KEY_ID="key",
+                AWS_SECRET_ACCESS_KEY="secret",
+            ),
+            patch("portolan_cli.sync.upload.S3Store") as mock_s3,
         ):
-            with patch("portolan_cli.sync.upload.S3Store") as mock_s3:
-                mock_s3.return_value = MagicMock()
+            mock_s3.return_value = MagicMock()
 
-                setup_store("s3://mybucket/data")
+            setup_store("s3://mybucket/data")
 
         call_kwargs = mock_s3.call_args[1]
         assert "region" not in call_kwargs
@@ -2331,18 +2334,20 @@ class TestDryRunNetworkIsolation:
         """
         from portolan_cli.sync.push import push
 
-        with patch(
-            "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
-        ) as mock_fetch:
-            with patch("portolan_cli.sync.push.setup_store") as mock_setup:
-                mock_setup.return_value = (MagicMock(), "prefix")
+        with (
+            patch(
+                "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
+            ) as mock_fetch,
+            patch("portolan_cli.sync.push.setup_store") as mock_setup,
+        ):
+            mock_setup.return_value = (MagicMock(), "prefix")
 
-                result = push(
-                    catalog_root=local_catalog,
-                    collection="test",
-                    destination="s3://mybucket/catalog",
-                    dry_run=True,
-                )
+            result = push(
+                catalog_root=local_catalog,
+                collection="test",
+                destination="s3://mybucket/catalog",
+                dry_run=True,
+            )
 
         # Neither network operation should be called
         mock_fetch.assert_not_called()
@@ -2369,16 +2374,16 @@ class TestDryRunNetworkIsolation:
         """push(dry_run=True) should report files that would be uploaded."""
         from portolan_cli.sync.push import push
 
-        with patch("portolan_cli.sync.push.setup_store"):
-            with patch(
-                "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
-            ):
-                result = push(
-                    catalog_root=local_catalog,
-                    collection="test",
-                    destination="s3://mybucket/catalog",
-                    dry_run=True,
-                )
+        with (
+            patch("portolan_cli.sync.push.setup_store"),
+            patch("portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock),
+        ):
+            result = push(
+                catalog_root=local_catalog,
+                collection="test",
+                destination="s3://mybucket/catalog",
+                dry_run=True,
+            )
 
         assert result.success is True
         assert result.files_uploaded == 0  # dry-run never uploads
@@ -2391,19 +2396,19 @@ class TestDryRunNetworkIsolation:
         """push(dry_run=True) must not call _upload_assets."""
         from portolan_cli.sync.push import push
 
-        with patch("portolan_cli.sync.push.setup_store"):
-            with patch(
-                "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
-            ):
-                with patch(
-                    "portolan_cli.sync.push._upload_assets_async", new_callable=AsyncMock
-                ) as mock_upload:
-                    push(
-                        catalog_root=local_catalog,
-                        collection="test",
-                        destination="s3://mybucket/catalog",
-                        dry_run=True,
-                    )
+        with (
+            patch("portolan_cli.sync.push.setup_store"),
+            patch("portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock),
+            patch(
+                "portolan_cli.sync.push._upload_assets_async", new_callable=AsyncMock
+            ) as mock_upload,
+        ):
+            push(
+                catalog_root=local_catalog,
+                collection="test",
+                destination="s3://mybucket/catalog",
+                dry_run=True,
+            )
 
         mock_upload.assert_not_called()
 
@@ -2412,26 +2417,28 @@ class TestDryRunNetworkIsolation:
         """Non-dry-run push must still call _fetch_remote_versions (sanity check)."""
         from portolan_cli.sync.push import push
 
-        with patch(
-            "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
-        ) as mock_fetch:
-            with patch("portolan_cli.sync.push.setup_store") as mock_setup:
-                mock_fetch.return_value = (None, None)
-                mock_setup.return_value = (MagicMock(), "prefix")
+        with (
+            patch(
+                "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
+            ) as mock_fetch,
+            patch("portolan_cli.sync.push.setup_store") as mock_setup,
+        ):
+            mock_fetch.return_value = (None, None)
+            mock_setup.return_value = (MagicMock(), "prefix")
 
+            with patch(
+                "portolan_cli.sync.push._upload_assets_async", new_callable=AsyncMock
+            ) as mock_upload:
+                mock_upload.return_value = (1, [], ["key"], UploadMetrics())
                 with patch(
-                    "portolan_cli.sync.push._upload_assets_async", new_callable=AsyncMock
-                ) as mock_upload:
-                    mock_upload.return_value = (1, [], ["key"], UploadMetrics())
-                    with patch(
-                        "portolan_cli.sync.push._upload_versions_json_async", new_callable=AsyncMock
-                    ):
-                        push(
-                            catalog_root=local_catalog,
-                            collection="test",
-                            destination="s3://mybucket/catalog",
-                            dry_run=False,
-                        )
+                    "portolan_cli.sync.push._upload_versions_json_async", new_callable=AsyncMock
+                ):
+                    push(
+                        catalog_root=local_catalog,
+                        collection="test",
+                        destination="s3://mybucket/catalog",
+                        dry_run=False,
+                    )
 
         # Regular push MUST call both setup and fetch
         mock_setup.assert_called_once()
@@ -2478,17 +2485,17 @@ class TestDryRunNetworkIsolation:
         (collection_dir / "versions.json").write_text(json.dumps(versions_data, indent=2))
         # NOTE: We deliberately do NOT create the asset file
 
-        with patch("portolan_cli.sync.push.setup_store"):
-            with patch(
-                "portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock
-            ):
-                # Should NOT raise - dry-run is forgiving
-                result = push(
-                    catalog_root=catalog_dir,
-                    collection="test",
-                    destination="s3://mybucket/catalog",
-                    dry_run=True,
-                )
+        with (
+            patch("portolan_cli.sync.push.setup_store"),
+            patch("portolan_cli.sync.push._fetch_remote_versions_async", new_callable=AsyncMock),
+        ):
+            # Should NOT raise - dry-run is forgiving
+            result = push(
+                catalog_root=catalog_dir,
+                collection="test",
+                destination="s3://mybucket/catalog",
+                dry_run=True,
+            )
 
         # Dry-run should succeed but record the error
         assert result.success is True
@@ -2634,7 +2641,6 @@ class TestAssetDiffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
@@ -2690,7 +2696,6 @@ class TestAssetDiffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
@@ -2750,7 +2755,6 @@ class TestAssetDiffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
@@ -2797,19 +2801,20 @@ class TestAssetDiffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["1.0.0"],
             remote_versions_data=None,
         )
 
         assert len(assets) == 2
 
     @pytest.mark.unit
-    def test_considers_all_remote_versions_for_sha256_check(self, tmp_path: Path) -> None:
-        """Remote sha256 check should include ALL remote versions, not just latest.
+    def test_href_only_in_older_remote_version_uploads(self, tmp_path: Path) -> None:
+        """An href that the remote current snapshot omits must upload (Issue #962).
 
-        Scenario: Remote has versions 1.0.0 and 1.1.0 with different assets.
-        Local version 2.0.0 has an asset that matches 1.0.0's sha256.
-        It should be skipped even though it's not in 1.1.0.
+        This test replaces one that expected a skip. That test encoded the
+        any-version rule: a match in any remote version skipped the upload.
+        A versions.json entry is a complete snapshot. The remote current
+        version 1.1.0 does not list legacy.parquet, so nothing tells push
+        that the object key still holds those bytes.
         """
         from portolan_cli.sync.push import _get_assets_to_upload
 
@@ -2834,12 +2839,13 @@ class TestAssetDiffing:
         }
 
         remote_versions_data = {
+            "current_version": "1.1.0",
             "versions": [
                 {
                     "version": "1.0.0",
                     "assets": {
                         "legacy.parquet": {
-                            "sha256": "sha256_legacy",  # Same sha256!
+                            "sha256": "sha256_legacy",
                             "href": "legacy.parquet",
                         },
                     },
@@ -2853,18 +2859,16 @@ class TestAssetDiffing:
                         },
                     },
                 },
-            ]
+            ],
         }
 
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
-        # legacy.parquet exists in 1.0.0 with same sha256, should be skipped
-        assert len(assets) == 0
+        assert assets == [asset.resolve()]
 
     @pytest.mark.unit
     def test_handles_empty_remote_versions_list(self, tmp_path: Path) -> None:
@@ -2896,7 +2900,6 @@ class TestAssetDiffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["1.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
@@ -2958,7 +2961,6 @@ class TestAssetDiffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
@@ -3011,7 +3013,6 @@ class TestAssetDiffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
@@ -3063,12 +3064,264 @@ class TestAssetDiffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
         # Should upload since local has no sha256 to compare
         assert len(assets) == 1
+
+
+# =============================================================================
+# Asset Diffing Against the Remote Current Version (Issue #962)
+# =============================================================================
+
+
+def _snapshot(version: str, assets: dict[str, str]) -> dict[str, Any]:
+    """Build one versions.json entry that maps each href to its sha256."""
+    return {
+        "version": version,
+        "assets": {href: {"sha256": sha, "href": href} for href, sha in assets.items()},
+    }
+
+
+def _history(current: str, *entries: tuple[str, dict[str, str]]) -> dict[str, Any]:
+    """Build a versions.json document with the given current version."""
+    return {
+        "current_version": current,
+        "versions": [_snapshot(version, assets) for version, assets in entries],
+    }
+
+
+class TestAssetDiffingAgainstRemoteCurrent:
+    """Push compares each asset with the remote CURRENT snapshot (Issue #962).
+
+    Every version writes the same object key for an href. So only the remote
+    current snapshot tells push what each key holds now. An older remote
+    version can record bytes that a later push overwrote.
+    """
+
+    @pytest.mark.unit
+    def test_revert_to_bytes_of_older_remote_version_uploads(self, tmp_path: Path) -> None:
+        """Bytes A, then B, then A again. The third push must upload A.
+
+        Before the fix, push found (data.parquet, A) in remote 1.0.3 and
+        skipped the upload. The store kept B while versions.json recorded A.
+        """
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        data_file = tmp_path / "data.parquet"
+        data_file.write_bytes(b"bytes A")
+
+        local = _history(
+            "1.0.5",
+            ("1.0.3", {"data.parquet": "sha_A"}),
+            ("1.0.4", {"data.parquet": "sha_B"}),
+            ("1.0.5", {"data.parquet": "sha_A"}),
+        )
+        remote = _history(
+            "1.0.4", ("1.0.3", {"data.parquet": "sha_A"}), ("1.0.4", {"data.parquet": "sha_B"})
+        )
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert assets == [data_file.resolve()]
+
+    @pytest.mark.unit
+    def test_multi_version_push_compares_local_current_sha(self, tmp_path: Path) -> None:
+        """A push of 1.0.4 and 1.0.5 compares the sha256 that 1.0.5 records.
+
+        The file on disk holds the 1.0.5 bytes (C). Before the fix, push read
+        the oldest pushed entry (1.0.4, A), matched remote current A, and
+        skipped the upload. C never reached the store.
+        """
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        data_file = tmp_path / "data.parquet"
+        data_file.write_bytes(b"bytes C")
+        other_file = tmp_path / "other.parquet"
+        other_file.write_bytes(b"other")
+
+        local = _history(
+            "1.0.5",
+            ("1.0.3", {"data.parquet": "sha_A"}),
+            ("1.0.4", {"data.parquet": "sha_A", "other.parquet": "sha_X"}),
+            ("1.0.5", {"data.parquet": "sha_C", "other.parquet": "sha_X"}),
+        )
+        remote = _history("1.0.3", ("1.0.3", {"data.parquet": "sha_A"}))
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert sorted(assets) == sorted([data_file.resolve(), other_file.resolve()])
+
+    @pytest.mark.unit
+    def test_multi_version_push_skips_asset_whose_local_current_sha_matches_remote(
+        self, tmp_path: Path
+    ) -> None:
+        """An asset that changed and then changed back is skipped.
+
+        Pushed 1.0.4 records B and pushed 1.0.5 records A. The file on disk
+        holds A, and remote current also records A, so the key holds A.
+        """
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        (tmp_path / "data.parquet").write_bytes(b"bytes A")
+
+        local = _history(
+            "1.0.5",
+            ("1.0.3", {"data.parquet": "sha_A"}),
+            ("1.0.4", {"data.parquet": "sha_B"}),
+            ("1.0.5", {"data.parquet": "sha_A"}),
+        )
+        remote = _history("1.0.3", ("1.0.3", {"data.parquet": "sha_A"}))
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert assets == []
+
+    @pytest.mark.unit
+    def test_asset_identical_to_remote_current_is_skipped(self, tmp_path: Path) -> None:
+        """An asset whose sha256 equals the remote current entry is skipped.
+
+        An older remote version records other bytes for the same href. That
+        older entry must not force an upload.
+        """
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        (tmp_path / "data.parquet").write_bytes(b"bytes B")
+        new_file = tmp_path / "new.parquet"
+        new_file.write_bytes(b"new")
+
+        local = _history("1.0.5", ("1.0.5", {"data.parquet": "sha_B", "new.parquet": "sha_N"}))
+        remote = _history(
+            "1.0.4", ("1.0.3", {"data.parquet": "sha_A"}), ("1.0.4", {"data.parquet": "sha_B"})
+        )
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert assets == [new_file.resolve()]
+
+    @pytest.mark.unit
+    def test_force_push_without_new_versions_restores_local_current(self, tmp_path: Path) -> None:
+        """A force push with no new local version uploads the local current bytes.
+
+        Local holds 1.0.0 (A). Remote holds 1.0.0 (A) and 1.0.1 (B), so the
+        store holds B. `push --force` writes the local versions.json, which
+        records A. So push must upload A, although no version is local only.
+        """
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        data_file = tmp_path / "data.parquet"
+        data_file.write_bytes(b"bytes A")
+
+        local = _history("1.0.0", ("1.0.0", {"data.parquet": "sha_A"}))
+        remote = _history(
+            "1.0.1", ("1.0.0", {"data.parquet": "sha_A"}), ("1.0.1", {"data.parquet": "sha_B"})
+        )
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert assets == [data_file.resolve()]
+
+    @pytest.mark.unit
+    def test_asset_removed_by_a_later_pushed_version_is_not_uploaded(self, tmp_path: Path) -> None:
+        """A file that 1.0.1 adds and 1.0.2 removes is not part of the push.
+
+        The user deleted x.parquet. The local current snapshot 1.0.2 does not
+        list it, so push must not look for it on disk.
+        """
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        (tmp_path / "data.parquet").write_bytes(b"bytes A")
+
+        local = _history(
+            "1.0.2",
+            ("1.0.0", {"data.parquet": "sha_A"}),
+            ("1.0.1", {"data.parquet": "sha_A", "x.parquet": "sha_X"}),
+            ("1.0.2", {"data.parquet": "sha_A"}),
+        )
+        remote = _history("1.0.0", ("1.0.0", {"data.parquet": "sha_A"}))
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert assets == []
+
+    @pytest.mark.unit
+    def test_remote_current_asset_without_sha256_uploads(self, tmp_path: Path) -> None:
+        """A remote current entry with no sha256 cannot prove a match, so it uploads.
+
+        An older remote entry records the local sha256. It must not cause a skip.
+        """
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        data_file = tmp_path / "data.parquet"
+        data_file.write_bytes(b"bytes A")
+
+        local = _history("1.0.2", ("1.0.2", {"data.parquet": "sha_A"}))
+        remote = {
+            "current_version": "1.0.1",
+            "versions": [
+                _snapshot("1.0.0", {"data.parquet": "sha_A"}),
+                {"version": "1.0.1", "assets": {"data.parquet": {"href": "data.parquet"}}},
+            ],
+        }
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert assets == [data_file.resolve()]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "current_version",
+        [None, "9.9.9"],
+        ids=["current_version-missing", "current_version-matches-no-entry"],
+    )
+    def test_unusable_current_version_falls_back_to_last_entry(
+        self, tmp_path: Path, current_version: str | None
+    ) -> None:
+        """Without a usable current_version, the last remote entry is current.
+
+        The last entry records B. So local A uploads and local B is skipped.
+        The first entry records A, and it must not cause a skip.
+        """
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        a_file = tmp_path / "a.parquet"
+        a_file.write_bytes(b"bytes A")
+        (tmp_path / "b.parquet").write_bytes(b"bytes B")
+
+        local = {
+            "versions": [
+                _snapshot("1.0.2", {"a.parquet": "sha_A", "b.parquet": "sha_B"}),
+            ],
+        }
+        remote: dict[str, Any] = {
+            "versions": [
+                _snapshot("1.0.0", {"a.parquet": "sha_A", "b.parquet": "sha_A"}),
+                _snapshot("1.0.1", {"a.parquet": "sha_B", "b.parquet": "sha_B"}),
+            ],
+        }
+        if current_version is not None:
+            remote["current_version"] = current_version
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert assets == [a_file.resolve()]
+
+    @pytest.mark.unit
+    def test_current_version_selects_entry_that_is_not_last(self, tmp_path: Path) -> None:
+        """A current_version that names an earlier entry wins over the last entry."""
+        from portolan_cli.sync.push import _get_assets_to_upload
+
+        (tmp_path / "data.parquet").write_bytes(b"bytes A")
+
+        local = {"versions": [_snapshot("2.0.0", {"data.parquet": "sha_A"})]}
+        remote = _history(
+            "1.0.0", ("1.0.0", {"data.parquet": "sha_A"}), ("1.0.1", {"data.parquet": "sha_B"})
+        )
+
+        assets = _get_assets_to_upload(tmp_path, local, remote)
+
+        assert assets == []
 
 
 # =============================================================================
@@ -3140,7 +3393,6 @@ class TestRealSHA256Diffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["1.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
@@ -3211,7 +3463,6 @@ class TestRealSHA256Diffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 
@@ -3280,7 +3531,6 @@ class TestRealSHA256Diffing:
         assets = _get_assets_to_upload(
             catalog_root=catalog_dir,
             versions_data=local_versions_data,
-            versions_to_push=["2.0.0"],
             remote_versions_data=remote_versions_data,
         )
 

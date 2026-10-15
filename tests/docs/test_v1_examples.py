@@ -8,15 +8,17 @@ import subprocess
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow.parquet as pq
 import pytest
 
 from .philadelphia_arcgis_server import create_server
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 README = PROJECT_ROOT / "README.md"
@@ -138,12 +140,14 @@ def _run_query(catalog_url: str) -> subprocess.CompletedProcess[str]:
 def _collection(catalog_dir: Path, collection_id: str) -> dict[str, Any]:
     """Read one generated STAC Collection."""
     value = json.loads(_read_text(catalog_dir / collection_id / "collection.json"))
-    return cast(dict[str, Any], value)
+    return cast("dict[str, Any]", value)
 
 
 def _requests(request_log: Path) -> list[dict[str, Any]]:
     """Read the ArcGIS fixture server request log."""
-    return [cast(dict[str, Any], json.loads(line)) for line in _read_text(request_log).splitlines()]
+    return [
+        cast("dict[str, Any]", json.loads(line)) for line in _read_text(request_log).splitlines()
+    ]
 
 
 @pytest.mark.unit
@@ -208,13 +212,13 @@ def test_tutorial_uses_a_placeholder_contact() -> None:
 
 
 @pytest.mark.unit
-def test_docs_ci_uses_anonymous_http_minio() -> None:
+def test_docs_ci_uses_anonymous_http_rustfs() -> None:
     """The docs job does not send credentials to its plaintext test service."""
     workflow = _read_text(CI_WORKFLOW)
     docs_job = workflow.partition("\n  docs:\n")[2].partition("\n  build:\n")[0]
 
     assert docs_job
-    assert "mc anonymous set public local/portolan-docs" in docs_job
+    assert "put-bucket-policy --bucket portolan-docs" in docs_job
     assert "AWS_ACCESS_KEY_ID" not in docs_job
     assert "AWS_SECRET_ACCESS_KEY" not in docs_job
     assert 'PORTOLAN_S3_USE_SSL: "false"' in docs_job
@@ -260,7 +264,7 @@ def test_example_subprocess_forces_utf8_stdio(
     """The Windows test process can emit and capture tutorial symbols."""
 
     def capture_run(_command: object, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        environment = cast(dict[str, str], kwargs["env"])
+        environment = cast("dict[str, str]", kwargs["env"])
         assert environment["PYTHONIOENCODING"] == "utf-8"
         assert kwargs["encoding"] == "utf-8"
         assert "text" not in kwargs
@@ -283,6 +287,9 @@ def test_query_installs_spatial_before_loading_it() -> None:
     )
 
 
+# The example runs portolan in a subprocess. It draws thumbnails there, and the
+# no_basemap_tiles patch does not reach it.
+@pytest.mark.refused_hosts("a.basemaps.cartocdn.com")
 @pytest.mark.integration
 def test_example_builds_and_analyzes_a_philadelphia_catalog(tmp_path: Path) -> None:
     """The public workflow extracts, documents, validates, and analyzes two Collections."""
@@ -384,13 +391,16 @@ def test_example_builds_and_analyzes_a_philadelphia_catalog(tmp_path: Path) -> N
     assert query.stdout == EXPECTED_QUERY_OUTPUT
 
 
+# The example runs portolan in a subprocess. It draws thumbnails there, and the
+# no_basemap_tiles patch does not reach it.
+@pytest.mark.refused_hosts("a.basemaps.cartocdn.com")
 @pytest.mark.e2e
 def test_example_publishes_assets_that_remain_queryable_without_arcgis(
     tmp_path: Path,
 ) -> None:
     """CI queries the published Assets after the source service stops."""
-    if os.environ.get("PORTOLAN_DOCS_MINIO") != "1":
-        pytest.skip("Documentation MinIO service is not running")
+    if os.environ.get("PORTOLAN_DOCS_RUSTFS") != "1":
+        pytest.skip("Documentation RustFS service is not running")
 
     catalog_dir = tmp_path / "philadelphia-housing"
     remote = "s3://portolan-docs/philadelphia-housing"

@@ -22,32 +22,23 @@ Dry-Run Mode:
     Use dry-run mode for commands that modify state (add, sync,
     prune, repair) to preview operations before execution.
 
-Verbose Mode:
-    Add verbose=True to enable verbose output (reserved for future use):
-
-    info("Reading data.shp", verbose=True)
-
-    Currently, verbose mode has the same behavior as default. Future
-    enhancements may add technical details like file paths, sizes,
-    checksums, or internal library calls.
-
-Combined Modes:
-    Both modes can be active simultaneously:
-
-    success("Would write file.parquet (1.2 MB)", dry_run=True, verbose=True)
-    # Output: ✓ [DRY RUN] Would write file.parquet (1.2 MB)
+Writers:
+    A writer turns a styled message into terminal output. The default writer
+    imports no Click, so a library caller can use this module without the CLI
+    shell (#947). ``cli.py`` installs a writer that uses ``click.echo``, which
+    keeps the CLI behavior of CliRunner color handling and Windows consoles.
 """
 
 from __future__ import annotations
 
 import sys
 import threading
-from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, Protocol, TextIO
 
-import click
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 # Reentrant lock for console output to prevent interleaved output from concurrent threads
 # RLock allows nested acquisition (e.g., output_section() calling error() which also locks)
@@ -75,7 +66,6 @@ def output_section() -> Generator[None, None, None]:
         yield
 
 
-# ANSI color codes via click's style system
 _STYLES: dict[str, dict[str, str | bool]] = {
     "success": {"fg": "green"},
     "info": {"fg": "blue"},
@@ -92,6 +82,68 @@ _PREFIXES = {
     "detail": " ",  # space (no prefix, just indent)
 }
 
+# The SGR codes that click.style emits for the colors above.
+_ANSI_FG = {"green": 32, "blue": 34, "yellow": 33, "red": 31}
+_ANSI_DIM = 2
+_ANSI_RESET = "\x1b[0m"
+
+
+class Writer(Protocol):
+    """Write one styled message to a stream."""
+
+    def __call__(
+        self,
+        prefix: str,
+        message: str,
+        *,
+        fg: str | None,
+        dim: bool,
+        file: TextIO | None,
+        nl: bool,
+    ) -> None:
+        """Write ``prefix`` and ``message``, styled with ``fg`` and ``dim``."""
+
+
+def _ansi(text: str, fg: str | None, dim: bool) -> str:
+    """Wrap text in the ANSI codes ``click.style(text, fg=fg, dim=dim)`` emits."""
+    codes = ([f"\x1b[{_ANSI_FG[fg]}m"] if fg else []) + ([f"\x1b[{_ANSI_DIM}m"] if dim else [])
+    return "".join(codes) + text + _ANSI_RESET
+
+
+def default_writer(
+    prefix: str,
+    message: str,
+    *,
+    fg: str | None,
+    dim: bool,
+    file: TextIO | None,
+    nl: bool,
+) -> None:
+    """Write without Click. Add color only when the stream is a terminal.
+
+    ``sys.stdout`` resolves at call time, as it does in ``click.echo``.
+    """
+    stream = file if file is not None else sys.stdout
+    isatty = getattr(stream, "isatty", None)
+    if callable(isatty) and isatty():
+        prefix, message = _ansi(prefix, fg, dim), _ansi(message, fg, dim)
+    stream.write(f"{prefix} {message}" + ("\n" if nl else ""))
+    stream.flush()
+
+
+_writer: Writer = default_writer
+
+
+def set_writer(writer: Writer) -> None:
+    """Install the writer that every output function uses."""
+    global _writer
+    _writer = writer
+
+
+def get_writer() -> Writer:
+    """Return the installed writer."""
+    return _writer
+
 
 def _output(
     message: str,
@@ -100,7 +152,6 @@ def _output(
     file: TextIO | None = None,
     nl: bool = True,
     dry_run: bool = False,
-    verbose: bool = False,
 ) -> None:
     """Internal helper for styled output.
 
@@ -110,22 +161,18 @@ def _output(
         file: File to write to.
         nl: Whether to print a newline after the message.
         dry_run: If True, prefix message with [DRY RUN].
-        verbose: If True, show message (currently same behavior as default).
     """
     # Add dry-run prefix if enabled
     if dry_run:
         message = f"[DRY RUN] {message}"
 
-    prefix = _PREFIXES[style]
     style_kwargs = _STYLES[style]
     fg = str(style_kwargs["fg"]) if "fg" in style_kwargs else None
     dim = bool(style_kwargs.get("dim", False))
-    styled_prefix = click.style(prefix, fg=fg, dim=dim)
-    styled_message = click.style(message, fg=fg, dim=dim)
 
     # Thread-safe output to prevent interleaving from concurrent threads
     with _output_lock:
-        click.echo(f"{styled_prefix} {styled_message}", file=file, nl=nl)
+        _writer(_PREFIXES[style], message, fg=fg, dim=dim, file=file, nl=nl)
 
 
 def success(
@@ -134,7 +181,6 @@ def success(
     file: TextIO | None = None,
     nl: bool = True,
     dry_run: bool = False,
-    verbose: bool = False,
 ) -> None:
     """Print a success message with green checkmark.
 
@@ -143,7 +189,6 @@ def success(
         file: File to write to (default: stdout).
         nl: Whether to print a newline after the message.
         dry_run: If True, prefix with [DRY RUN] to indicate simulation mode.
-        verbose: If True, include verbose details (reserved for future use).
 
     Example:
         >>> success("Wrote output.parquet (1.2 MB)")
@@ -152,7 +197,7 @@ def success(
         >>> success("Would write file", dry_run=True)
         ✓ [DRY RUN] Would write file
     """
-    _output(message, "success", file=file, nl=nl, dry_run=dry_run, verbose=verbose)
+    _output(message, "success", file=file, nl=nl, dry_run=dry_run)
 
 
 def info(
@@ -161,7 +206,6 @@ def info(
     file: TextIO | None = None,
     nl: bool = True,
     dry_run: bool = False,
-    verbose: bool = False,
 ) -> None:
     """Print an info message with blue arrow.
 
@@ -170,7 +214,6 @@ def info(
         file: File to write to (default: stdout).
         nl: Whether to print a newline after the message.
         dry_run: If True, prefix with [DRY RUN] to indicate simulation mode.
-        verbose: If True, include verbose details (reserved for future use).
 
     Example:
         >>> info("Reading data.shp (4,231 features)")
@@ -179,7 +222,7 @@ def info(
         >>> info("Would read file", dry_run=True)
         → [DRY RUN] Would read file
     """
-    _output(message, "info", file=file, nl=nl, dry_run=dry_run, verbose=verbose)
+    _output(message, "info", file=file, nl=nl, dry_run=dry_run)
 
 
 def warn(
@@ -188,7 +231,6 @@ def warn(
     file: TextIO | None = None,
     nl: bool = True,
     dry_run: bool = False,
-    verbose: bool = False,
 ) -> None:
     """Print a warning message with yellow warning symbol.
 
@@ -197,7 +239,6 @@ def warn(
         file: File to write to (default: stderr).
         nl: Whether to print a newline after the message.
         dry_run: If True, prefix with [DRY RUN] to indicate simulation mode.
-        verbose: If True, include verbose details (reserved for future use).
 
     Example:
         >>> warn("Missing thumbnail (recommended)")
@@ -206,7 +247,7 @@ def warn(
         >>> warn("Would skip validation", dry_run=True)
         ⚠ [DRY RUN] Would skip validation
     """
-    _output(message, "warn", file=file or sys.stderr, nl=nl, dry_run=dry_run, verbose=verbose)
+    _output(message, "warn", file=file or sys.stderr, nl=nl, dry_run=dry_run)
 
 
 def error(
@@ -215,7 +256,6 @@ def error(
     file: TextIO | None = None,
     nl: bool = True,
     dry_run: bool = False,
-    verbose: bool = False,
 ) -> None:
     """Print an error message with red X.
 
@@ -224,7 +264,6 @@ def error(
         file: File to write to (default: stderr).
         nl: Whether to print a newline after the message.
         dry_run: If True, prefix with [DRY RUN] to indicate simulation mode.
-        verbose: If True, include verbose details (reserved for future use).
 
     Example:
         >>> error("No geometry column (required)")
@@ -233,7 +272,7 @@ def error(
         >>> error("Would fail validation", dry_run=True)
         ✗ [DRY RUN] Would fail validation
     """
-    _output(message, "error", file=file or sys.stderr, nl=nl, dry_run=dry_run, verbose=verbose)
+    _output(message, "error", file=file or sys.stderr, nl=nl, dry_run=dry_run)
 
 
 def detail(
@@ -242,7 +281,6 @@ def detail(
     file: TextIO | None = None,
     nl: bool = True,
     dry_run: bool = False,
-    verbose: bool = False,
 ) -> None:
     """Print a detail/progress message in dimmed text.
 
@@ -251,7 +289,6 @@ def detail(
         file: File to write to (default: stdout).
         nl: Whether to print a newline after the message.
         dry_run: If True, prefix with [DRY RUN] to indicate simulation mode.
-        verbose: If True, include verbose details (reserved for future use).
 
     Example:
         >>> detail("Processing chunk 3/10...")
@@ -260,7 +297,7 @@ def detail(
         >>> detail("Would process chunk", dry_run=True)
           [DRY RUN] Would process chunk
     """
-    _output(message, "detail", file=file, nl=nl, dry_run=dry_run, verbose=verbose)
+    _output(message, "detail", file=file, nl=nl, dry_run=dry_run)
 
 
 def progress(
@@ -291,10 +328,7 @@ def progress(
         → Converting to COG (1 of 5): data.tif
     """
     # Extract just the filename, not the full path
-    if isinstance(filename, Path):
-        name = filename.name
-    else:
-        name = Path(filename).name
+    name = filename.name if isinstance(filename, Path) else Path(filename).name
 
     # Build the message
     if context:
@@ -302,4 +336,4 @@ def progress(
     else:
         message = f"Processing file {current} of {total}: {name}"
 
-    _output(message, "info", file=file, nl=True, dry_run=False, verbose=False)
+    _output(message, "info", file=file, nl=True, dry_run=False)

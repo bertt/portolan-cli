@@ -26,12 +26,17 @@ See:
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatch
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from portolan_cli.config import load_config
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -160,12 +165,35 @@ def get_conversion_overrides(catalog_path: Path) -> ConversionOverrides:
     )
 
 
+def get_handler_pins(catalog_path: Path) -> dict[str, str]:
+    """Load ``conversion.handlers``: the format handler to use per extension (#947).
+
+    A pin decides between format handlers that claim the same extension::
+
+        conversion:
+          handlers:
+            .tif: cog
+
+    Args:
+        catalog_path: Root path of the catalog.
+
+    Returns:
+        Lowercase extension with a leading dot, to handler name.
+    """
+    handlers = _get_dict(_get_dict(load_config(catalog_path), "conversion"), "handlers")
+    pins: dict[str, str] = {}
+    for extension, name in handlers.items():
+        ext = str(extension).strip().lower()
+        pins[ext if ext.startswith(".") else f".{ext}"] = str(name).strip()
+    return pins
+
+
 # =============================================================================
 # COG Settings (Issue #279)
 # =============================================================================
 
-# Valid compression algorithms supported by rio-cogeo
-# See: rio_cogeo.profiles.cog_profiles
+# The compression algorithms that rio-cogeo accepts. The module
+# rio_cogeo.profiles holds the profile table that these names index.
 VALID_COG_COMPRESSIONS: frozenset[str] = frozenset(
     {
         "DEFLATE",
@@ -273,7 +301,7 @@ def derive_cog_defaults(source: Path) -> tuple[int, str]:
         logger.debug("Could not inspect %s for COG defaults (%s); using fallback", source, exc)
         return FALLBACK_PREDICTOR, FALLBACK_RESAMPLING
 
-    if dtype.startswith("float") or dtype.startswith("complex"):
+    if dtype.startswith(("float", "complex")):
         return 3, "average"
     if dtype == "uint8" and band_count >= 3:
         return 1, FALLBACK_RESAMPLING
@@ -411,7 +439,36 @@ def validate_cog_settings(settings: CogSettings) -> list[str]:
     return warnings
 
 
-def get_cog_settings(catalog_path: Path) -> CogSettings:
+_SETTINGS_OVERRIDE: ContextVar[tuple[CogSettings | None, VectorSettings | None]] = ContextVar(
+    "portolan_conversion_settings_override", default=(None, None)
+)
+
+
+@contextmanager
+def settings_override(
+    cog: CogSettings | None = None, vector: VectorSettings | None = None
+) -> Iterator[None]:
+    """Make ``get_cog_settings`` and ``get_vector_settings`` return these values.
+
+    ``convert_file`` takes explicit settings, and a format handler loads its
+    settings by catalog root (#947). The override carries the explicit
+    settings to the handler. A None value leaves that loader unchanged.
+
+    Args:
+        cog: COG settings to return, or None.
+        vector: Vector settings to return, or None.
+
+    Yields:
+        Nothing. The override ends with the block.
+    """
+    token = _SETTINGS_OVERRIDE.set((cog, vector))
+    try:
+        yield
+    finally:
+        _SETTINGS_OVERRIDE.reset(token)
+
+
+def get_cog_settings(catalog_path: Path | None) -> CogSettings:
     """Load COG conversion settings from catalog config.
 
     Reads the 'conversion.cog' section from .portolan/config.yaml and returns
@@ -427,6 +484,11 @@ def get_cog_settings(catalog_path: Path) -> CogSettings:
     Returns:
         CogSettings instance. Returns defaults if no config exists.
     """
+    override = _SETTINGS_OVERRIDE.get()[0]
+    if override is not None:
+        return override
+    if catalog_path is None:
+        return CogSettings()
     config = load_config(catalog_path)
 
     conversion = _get_dict(config, "conversion")
@@ -439,10 +501,7 @@ def get_cog_settings(catalog_path: Path) -> CogSettings:
 
     # Parse individual settings with type validation
     compression = cog.get("compression")
-    if isinstance(compression, str):
-        compression = compression.upper()
-    else:
-        compression = "DEFLATE"
+    compression = compression.upper() if isinstance(compression, str) else "DEFLATE"
 
     quality = cog.get("quality")
     if not isinstance(quality, int):
@@ -642,7 +701,7 @@ def _warn_once(catalog_path: Path, message: str) -> None:
     warn(message)
 
 
-def get_vector_settings(catalog_path: Path) -> VectorSettings:
+def get_vector_settings(catalog_path: Path | None) -> VectorSettings:
     """Load vector conversion settings from catalog config.
 
     Reads the 'conversion.vector' section from .portolan/config.yaml and returns
@@ -654,6 +713,11 @@ def get_vector_settings(catalog_path: Path) -> VectorSettings:
     Returns:
         VectorSettings instance. Returns defaults if no config exists.
     """
+    override = _SETTINGS_OVERRIDE.get()[1]
+    if override is not None:
+        return override
+    if catalog_path is None:
+        return VectorSettings()
     config = load_config(catalog_path)
 
     conversion = _get_dict(config, "conversion")
@@ -666,10 +730,7 @@ def get_vector_settings(catalog_path: Path) -> VectorSettings:
 
     # Parse spatial_index
     spatial_index = vector.get("spatial_index")
-    if not isinstance(spatial_index, str):
-        spatial_index = "none"
-    else:
-        spatial_index = spatial_index.lower()
+    spatial_index = "none" if not isinstance(spatial_index, str) else spatial_index.lower()
 
     # Parse resolution
     resolution: int | str = vector.get("resolution", "auto")
@@ -687,10 +748,7 @@ def get_vector_settings(catalog_path: Path) -> VectorSettings:
     # Parse sort. A missing or non-string value keeps the default rather than
     # disabling the optimization (issue #805).
     sort = vector.get("sort")
-    if not isinstance(sort, str):
-        sort = DEFAULT_SORT
-    else:
-        sort = sort.lower()
+    sort = DEFAULT_SORT if not isinstance(sort, str) else sort.lower()
 
     # Parse add_bbox
     add_bbox = vector.get("add_bbox")

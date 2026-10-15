@@ -37,7 +37,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.6.14"
 
@@ -94,27 +94,29 @@ jobs:
             echo "$AUDIT_OUTPUT"
           fi
 
-      - name: Also run bandit for code security
-        id: bandit
+      - name: Also run the ruff security rules for code security
+        id: code-security
         continue-on-error: true
         run: |
-          # Bandit checks our code, not dependencies
-          uv run bandit -r portolan_cli -c pyproject.toml -f json -o bandit-report.json || true
-          if [ -f bandit-report.json ]; then
-            ISSUE_COUNT=$(jq '.results | length' bandit-report.json)
+          # The S rules check our code, not the dependencies. The quality job
+          # gates them on every commit. This report keeps the nightly artifact.
+          uv run ruff check --select S --output-format json \
+            -o ruff-security-report.json portolan_cli || true
+          if [ -f ruff-security-report.json ]; then
+            ISSUE_COUNT=$(jq 'length' ruff-security-report.json)
             if [ "$ISSUE_COUNT" -gt 0 ]; then
-              echo "::warning::Bandit found $ISSUE_COUNT issues"
+              echo "::warning::The ruff S rules found $ISSUE_COUNT issues"
             fi
           fi
 
       - name: Upload audit artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-audit-reports
           path: |
             /tmp/runtime-deps.txt
             /tmp/pip-audit-report.json
-            bandit-report.json
+            ruff-security-report.json
           retention-days: 30
         if: always()
 
