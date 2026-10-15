@@ -688,14 +688,14 @@ def test_skip_reason_records_a_skipped_layer_without_fetching(
 ) -> None:
     source = _SkippingSource(fixtures_dir)
     out = tmp_path / "out"
-    steps: list[tuple[str, str]] = []
+    steps: list[tuple[str, str, str | None]] = []
 
     report = run_layer_extraction(
         source,
         "https://example.org/src",
         out,
         _options(),
-        on_progress=lambda p: steps.append((p.layer_name, p.status)),
+        on_progress=lambda p: steps.append((p.layer_name, p.status, p.error)),
     )
 
     assert source.fetched == ["points"]
@@ -705,7 +705,7 @@ def test_skip_reason_records_a_skipped_layer_without_fetching(
     ]
     assert report.layers[1].error == "skipped: no Query capability"
     assert (report.summary.succeeded, report.summary.skipped, report.summary.failed) == (1, 1, 0)
-    assert ("lines", "skipped") in steps
+    assert ("lines", "skipped", "skipped: no Query capability") in steps
     assert (out / "points" / "collection.json").is_file()
     assert not (out / "lines").exists()
 

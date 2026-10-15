@@ -144,7 +144,7 @@ def make_extract_progress_callback(
             # Issue #504: show the error inline instead of "Failed" alone.
             warn(f"  ✗ Failed: {progress.error}" if progress.error else "  ✗ Failed")
         elif progress.status == "skipped":
-            detail(skipped_message)
+            detail(f"  ↪ {progress.error}" if progress.error else skipped_message)
 
     return on_progress
 

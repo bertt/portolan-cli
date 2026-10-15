@@ -887,9 +887,8 @@ def run_layer_extraction(
     jobs: list[tuple[int, LayerRef]] = []
     for index, layer in enumerate(layers):
         if layer.skip_reason:
-            logger.warning("Layer '%s' %s", layer.name, layer.skip_reason)
             run.emit(index, total, layer, "starting")
-            run.emit(index, total, layer, "skipped")
+            run.emit(index, total, layer, "skipped", layer.skip_reason)
             collected.append((index, _skipped(layer)))
             continue
         previous = _resumed_result(layer, output_dir, done_by_path, by_name)
