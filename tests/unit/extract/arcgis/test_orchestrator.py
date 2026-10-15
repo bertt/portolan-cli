@@ -23,6 +23,7 @@ from portolan_cli.extract.arcgis.orchestrator import (
     ExtractionOptions,
     ExtractionProgress,
     ServicesRootDiscoveryResult,
+    _collect_layers_from_services,
     _discover_and_filter_services,
     _ensure_geoparquet_crs,
     _extract_single_layer,
@@ -1367,7 +1368,7 @@ def test_extract_routes_folder_url_and_attaches_coverage(
     )
     monkeypatch.setattr(
         "portolan_cli.extract.arcgis.orchestrator._collect_layers_from_services",
-        lambda services, base_url, timeout: ([], {}, {}, []),
+        lambda services, base_url, timeout, skipped_out=None: ([], {}, {}, []),
     )
     report = extract_arcgis_catalog(
         url="https://x/server/rest/services/ecml",
@@ -1861,3 +1862,120 @@ def test_extract_single_layer_skips_spatial_ops_without_geometry(
 
     assert calls == []
     assert (tmp_path / "out.parquet").exists()
+
+
+# =============================================================================
+# Layers without Query capability (issue #1001)
+# =============================================================================
+
+NO_QUERY_REASON = "skipped: no Query capability (tiles-only)"
+
+
+def _tiles_only_discovery() -> ServiceDiscoveryResult:
+    return ServiceDiscoveryResult(
+        layers=[],
+        skipped_layers=[LayerInfo(id=0, name="punten", layer_type="Feature Layer")],
+        skip_reason=NO_QUERY_REASON,
+    )
+
+
+def test_single_service_reports_no_query_layers_as_skipped(tmp_path: Path) -> None:
+    with (
+        patch(
+            "portolan_cli.extract.arcgis.orchestrator.discover_layers",
+            return_value=_tiles_only_discovery(),
+        ),
+        patch("portolan_cli.extract.arcgis.orchestrator._extract_single_layer") as mock_extract,
+    ):
+        report = extract_arcgis_catalog(
+            url=TEST_FEATURE_SERVER_URL,
+            output_dir=tmp_path,
+            options=ExtractionOptions(raw=True),
+        )
+
+    mock_extract.assert_not_called()
+    assert [r.status for r in report.layers] == ["skipped"]
+    assert report.layers[0].error == NO_QUERY_REASON
+    assert report.summary.skipped == 1
+    assert report.summary.failed == 0
+
+
+def test_single_service_skipped_layers_respect_layer_filter(tmp_path: Path) -> None:
+    with patch(
+        "portolan_cli.extract.arcgis.orchestrator.discover_layers",
+        return_value=_tiles_only_discovery(),
+    ):
+        report = extract_arcgis_catalog(
+            url=TEST_FEATURE_SERVER_URL,
+            output_dir=tmp_path,
+            layer_exclude=["punten"],
+            options=ExtractionOptions(raw=True),
+        )
+
+    assert report.layers == []
+
+
+def test_collect_layers_gathers_skipped_layers_from_no_query_services() -> None:
+    results = {
+        "https://x/rest/services/Tiles/MapServer": _tiles_only_discovery(),
+        "https://x/rest/services/Good/FeatureServer": ServiceDiscoveryResult(
+            layers=[LayerInfo(id=0, name="roads", layer_type="Feature Layer")]
+        ),
+    }
+    services = [ServiceInfo("Tiles", "MapServer"), ServiceInfo("Good", "FeatureServer")]
+    skipped: list[tuple[LayerInfo, str]] = []
+
+    with patch(
+        "portolan_cli.extract.arcgis.orchestrator.discover_layers",
+        side_effect=lambda url, timeout: results[url],
+    ):
+        layers, service_for_layer, counts, errors = _collect_layers_from_services(
+            services, "https://x/rest/services", 60.0, skipped_out=skipped
+        )
+
+    assert [layer.name for layer in layers] == ["roads"]
+    assert service_for_layer[0].name == "Good"
+    assert counts["Tiles"] == 0
+    assert errors == []
+    assert [(layer.name, reason) for layer, reason in skipped] == [
+        ("punten", f"Tiles: {NO_QUERY_REASON}")
+    ]
+
+
+def test_collect_layers_ignores_skipped_layers_without_skipped_out() -> None:
+    with patch(
+        "portolan_cli.extract.arcgis.orchestrator.discover_layers",
+        return_value=_tiles_only_discovery(),
+    ):
+        layers, _, _, errors = _collect_layers_from_services(
+            [ServiceInfo("Tiles", "MapServer")], "https://x/rest/services", 60.0
+        )
+
+    assert layers == []
+    assert errors == []
+
+
+def test_services_root_reports_no_query_layers_as_skipped_not_failed(tmp_path: Path) -> None:
+    with (
+        patch(
+            "portolan_cli.extract.arcgis.orchestrator.discover_services_recursive",
+            return_value=(
+                [ServiceInfo("Tiles", "MapServer")],
+                FolderTraversal(visited=[], skipped=[], service_count=1),
+            ),
+        ),
+        patch(
+            "portolan_cli.extract.arcgis.orchestrator.discover_layers",
+            return_value=_tiles_only_discovery(),
+        ),
+    ):
+        report = extract_arcgis_catalog(
+            url="https://services-eu1.arcgis.com/abc/ArcGIS/rest/services",
+            output_dir=tmp_path,
+            options=ExtractionOptions(raw=True),
+        )
+
+    assert [r.status for r in report.layers] == ["skipped"]
+    assert report.layers[0].error == f"Tiles: {NO_QUERY_REASON}"
+    assert report.summary.failed == 0
+    assert report.summary.skipped == 1

@@ -498,6 +498,22 @@ def _build_dry_run_report(
     return _build_report(url=url, discovery_result=discovery_result, layer_results=dry_run_results)
 
 
+def _skipped_layer_result(layer: LayerInfo, reason: str) -> LayerResult:
+    """Build a LayerResult for a layer that was skipped without a download attempt."""
+    return LayerResult(
+        id=layer.id,
+        name=layer.name,
+        status="skipped",
+        features=0,
+        size_bytes=0,
+        duration_seconds=0.0,
+        output_path="",
+        warnings=[],
+        error=reason,
+        attempts=0,
+    )
+
+
 def _extract_layers(
     url: str,
     output_dir: Path,
@@ -718,6 +734,12 @@ def extract_arcgis_catalog(
     layer_results = _extract_layers(
         url, output_dir, layers, options, resume_state, existing_results, on_progress
     )
+    skip_reason = discovery_result.skip_reason or ""
+    for skipped in _filter_discovered_layers(
+        discovery_result.skipped_layers, layer_filter, layer_exclude
+    ):
+        logger.warning("Layer '%s' %s", skipped.name, skip_reason)
+        layer_results.append(_skipped_layer_result(skipped, skip_reason))
 
     # Build and save report
     report = _build_report(
@@ -1002,6 +1024,7 @@ def _collect_layers_from_services(
     services: list[ServiceInfo],
     base_url: str,
     timeout: float,
+    skipped_out: list[tuple[LayerInfo, str]] | None = None,
 ) -> tuple[list[LayerInfo], dict[int, ServiceInfo], dict[str, int], list[tuple[str, str]]]:
     """Collect all layers from multiple services.
 
@@ -1011,6 +1034,9 @@ def _collect_layers_from_services(
         - service_for_layer: Maps layer index to its source service
         - layer_count_per_service: Maps service name to total layer count (for flatten logic)
         - discovery_errors: List of (service_name, error_message) tuples
+
+    Layers of services without Query capability are not returned as extractable.
+    When skipped_out is given, they are appended to it as (layer, reason) pairs.
     """
     all_layers: list[LayerInfo] = []
     service_for_layer: dict[int, ServiceInfo] = {}
@@ -1021,6 +1047,11 @@ def _collect_layers_from_services(
         service_url = service.get_url(base_url)
         try:
             service_discovery = discover_layers(service_url, timeout=timeout)
+            if skipped_out is not None and service_discovery.skip_reason:
+                skipped_out.extend(
+                    (layer, f"{service.name}: {service_discovery.skip_reason}")
+                    for layer in service_discovery.skipped_layers
+                )
             # Track layer count for this service (for flatten logic)
             layer_count_per_service[service.name] = len(service_discovery.layers)
             for layer in service_discovery.layers:
@@ -1122,8 +1153,11 @@ def _extract_services_root(
     )
 
     # Collect layers from all services
+    skipped_layers: list[tuple[LayerInfo, str]] = []
     all_layers, service_for_layer, layer_count_per_service, _discovery_errors = (
-        _collect_layers_from_services(services, parsed.base_url, options.timeout)
+        _collect_layers_from_services(
+            services, parsed.base_url, options.timeout, skipped_out=skipped_layers
+        )
     )
 
     # Apply layer filters
@@ -1281,6 +1315,10 @@ def _extract_services_root(
                 )
             )
             emit_progress(on_progress, progress_idx, total, layer.name, "failed", error=error_msg)
+
+    for skipped_layer, reason in skipped_layers:
+        logger.warning("Layer '%s' %s", skipped_layer.name, reason)
+        layer_results.append(_skipped_layer_result(skipped_layer, reason))
 
     # Build and save report
     combined_discovery = ServiceDiscoveryResult(
