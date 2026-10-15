@@ -1912,3 +1912,39 @@ def test_services_root_reports_no_query_layers_as_skipped_not_failed(tmp_path: P
     assert report.layers[0].error == f"Tiles: {NO_QUERY_REASON}"
     assert report.summary.failed == 0
     assert report.summary.skipped == 1
+
+
+def test_services_root_filters_skipped_layers_and_keeps_each_reason(tmp_path: Path) -> None:
+    root = "https://services-eu1.arcgis.com/abc/ArcGIS/rest/services"
+    tiles = {
+        f"{root}/A/MapServer": ("A", "punten"),
+        f"{root}/B/MapServer": ("B", "lijnen"),
+    }
+
+    def fake_discover(url: str, timeout: float) -> ServiceDiscoveryResult:
+        return ServiceDiscoveryResult(
+            layers=[],
+            skipped_layers=[LayerInfo(id=0, name=tiles[url][1], layer_type="Feature Layer")],
+            skip_reason=NO_QUERY_REASON,
+        )
+
+    with (
+        patch(
+            "portolan_cli.extract.arcgis.orchestrator.discover_services_recursive",
+            return_value=(
+                [ServiceInfo("A", "MapServer"), ServiceInfo("B", "MapServer")],
+                FolderTraversal(visited=[], skipped=[], service_count=2),
+            ),
+        ),
+        patch(
+            "portolan_cli.extract.arcgis.orchestrator.discover_layers", side_effect=fake_discover
+        ),
+    ):
+        report = extract_arcgis_catalog(
+            url=root,
+            output_dir=tmp_path,
+            layer_exclude=["punten"],
+            options=ExtractionOptions(raw=True),
+        )
+
+    assert [(r.name, r.error) for r in report.layers] == [("lijnen", f"B: {NO_QUERY_REASON}")]
