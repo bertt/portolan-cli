@@ -39,10 +39,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from rashid import validate
 from rashid.data.reader import LocalOnlyReader
 
+from portolan_cli.errors import InvalidLiveUrlError
+from portolan_cli.trace import span
 from portolan_cli.validation.config import load_public_url, load_rules_config
 from portolan_cli.validation.legacy import detect_legacy_notes
 
@@ -116,6 +119,28 @@ def _resolve_root(path: Path) -> Path:
     from portolan_cli.scan.check import resolve_catalog_root_for_check
 
     return resolve_catalog_root_for_check(path) or path
+
+
+def validate_live_base_url(path: Path, public_url: str | None) -> None:
+    """Reject invalid live URLs before validation or any requested repair.
+
+    Match rashid's HTTPS-only policy. Also require a host and a valid port.
+    rashid accepts a URL without them, and every probe then fails one by one.
+    The error names the URL's source and does not expose the URL, which can
+    contain credentials.
+    """
+    base_url = public_url or load_public_url(_resolve_root(path))
+    if base_url is None:
+        return
+    source = "--url" if public_url else "publish.public_url"
+    try:
+        parsed = urlparse(base_url)
+        # urlparse defers port parsing. Reading .port raises on a bad port.
+        _ = parsed.port
+    except ValueError as err:
+        raise InvalidLiveUrlError(source) from err
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise InvalidLiveUrlError(source)
 
 
 def _live_hint(root: Path, public_url: str | None, *, live: bool) -> LiveHint | None:
@@ -240,34 +265,39 @@ def run_check(
     report: Report | None = None
     notice: WorkflowNotice | None = None
     if metadata:
+        if live:
+            validate_live_base_url(root, public_url)
         # One extra manifest walk per run. `run_fix_workflow` walks separately
         # under --fix; deduping the two is a later refactor, not this change.
         notice = _workflow_notice(root)
-        report = validate(
-            root,
-            config=load_rules_config(root),
-            structural=structural,
-            structural_validator=structural_validator,
-            schema=schema,
-            schema_validator=schema_validator,
-            data=data,
-            data_reader_factory=LocalOnlyReader if data_scope == "local" else None,
-            live=live,
-            live_prober=live_prober,
-            live_base_url=public_url or load_public_url(root),
-        )
+        # rashid runs every rule in one call, so the span covers all validators.
+        with span("check.validate", structural=structural, schema=schema, data=data, live=live):
+            report = validate(
+                root,
+                config=load_rules_config(root),
+                structural=structural,
+                structural_validator=structural_validator,
+                schema=schema,
+                schema_validator=schema_validator,
+                data=data,
+                data_reader_factory=LocalOnlyReader if data_scope == "local" else None,
+                live=live,
+                live_prober=live_prober,
+                live_base_url=public_url or load_public_url(root),
+            )
 
     format_report = None
     if geo_assets:
         from portolan_cli.scan.check import check_directory
 
-        format_report = check_directory(
-            path,
-            fix=False,
-            dry_run=False,
-            workers=workers,
-            catalog_path=path,
-        )
+        with span("check.geo_assets"):
+            format_report = check_directory(
+                path,
+                fix=False,
+                dry_run=False,
+                workers=workers,
+                catalog_path=path,
+            )
 
     return CheckOutcome(
         report=report,

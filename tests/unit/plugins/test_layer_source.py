@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from click.testing import CliRunner
 
+from portolan_cli import trace
 from portolan_cli.extract.common.source import (
     Discovery,
     EmptyLayerError,
@@ -614,12 +615,19 @@ def test_timeout_scan_skips_a_layer_that_finished(
 def test_timed_out_layer_stops_its_retries(fixtures_dir: Path, tmp_path: Path) -> None:
     """A timed-out layer does not retry after the run, so it leaves no staged copy."""
     calls: list[str] = []
+    workers: list[threading.Thread] = []
+    run_returned = threading.Event()
 
     class _FailSlowly(_FixtureSource):
         def fetch(self, source: str, layer: LayerRef, dest: Path) -> int:
             if layer.name == "points":
                 calls.append(layer.name)
-                time.sleep(1.5)
+                workers.append(threading.current_thread())
+                # Fail only after the run gave up on the layer. A fixed sleep
+                # raced the deadline check on a loaded CI runner, and the
+                # first failure then reached a retry before the run marked
+                # the layer abandoned.
+                run_returned.wait(timeout=30)
                 raise ConnectionError("points is down")
             return super().fetch(source, layer, dest)
 
@@ -630,8 +638,12 @@ def test_timed_out_layer_stops_its_retries(fixtures_dir: Path, tmp_path: Path) -
         out,
         _options(workers=2, layer_timeout=1.0, retries=3, raw=True),
     )
-    time.sleep(2.0)
+    run_returned.set()
+    # The run shut its executor down, so the worker exits after its last
+    # attempt and its cleanup.
+    workers[0].join(timeout=30)
 
+    assert not workers[0].is_alive()
     assert calls == ["points"]
     assert not (out / ".portolan" / "staging").exists()
 
@@ -728,3 +740,36 @@ def test_skipped_layer_stays_skipped_on_resume(fixtures_dir: Path, tmp_path: Pat
 
     assert source.fetched == []
     assert [r.status for r in report.layers] == ["success", "skipped"]
+
+
+def test_report_holds_the_fetch_wall_time(fixtures_dir: Path, tmp_path: Path) -> None:
+    """The summary holds the fetch wall time next to the per-layer sum (#991)."""
+    source = _FixtureSource(fixtures_dir, slow={"points": 0.2, "lines": 0.2})
+
+    report = run_layer_extraction(source, "src", tmp_path / "out", _options(workers=2, raw=True))
+
+    summary = report.summary
+    assert summary.wall_duration_seconds is not None
+    # The two layers overlap, so the sum of their durations exceeds the wall time.
+    assert summary.total_duration_seconds > summary.wall_duration_seconds
+    saved = _report(tmp_path / "out")["summary"]
+    assert saved["wall_duration_seconds"] == summary.wall_duration_seconds
+
+
+def test_layer_spans_nest_under_fetch_on_worker_threads(fixtures_dir: Path, tmp_path: Path) -> None:
+    """Each layer gets an extract.layer span under extract.fetch, on its worker thread (#991)."""
+    trace.enable()
+    source = _FixtureSource(fixtures_dir, slow={"points": 0.1})
+
+    run_layer_extraction(source, "src", tmp_path / "out", _options(workers=2, raw=True))
+
+    meta = trace.meta()
+    assert meta is not None
+    names = [node["name"] for node in meta["timings"]]
+    assert names == ["extract.discover", "extract.filter", "extract.fetch", "extract.report"]
+    fetch = meta["timings"][2]
+    layers = fetch["children"]
+    assert sorted(node["attrs"]["layer"] for node in layers) == ["lines", "points"]
+    assert all(node["attrs"]["status"] == "success" for node in layers)
+    assert all(node["attrs"]["attempts"] == 1 for node in layers)
+    assert all(node["tid"] != threading.main_thread().native_id for node in layers)
