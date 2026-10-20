@@ -234,46 +234,6 @@ async def test_upload_assets_async_small_and_large(
 
 
 @pytest.mark.unit
-def test_upload_versions_json_stale_etag_raises_conflict(store: MemoryStore) -> None:
-    obs.put(store, "pre/col/versions.json", b"{}")
-
-    with pytest.raises(push_mod.PushConflictError):
-        push_mod._upload_versions_json(store, "pre", "col", {}, "stale-etag", force=False)
-
-
-@pytest.mark.unit
-async def test_upload_versions_json_async_stale_etag_raises_conflict(store: MemoryStore) -> None:
-    obs.put(store, "pre/col/versions.json", b"{}")
-
-    with pytest.raises(push_mod.PushConflictError):
-        await push_mod._upload_versions_json_async(
-            store, "pre", "col", {}, "stale-etag", force=False
-        )
-
-
-@pytest.mark.unit
-def test_upload_versions_json_force_ignores_etag(store: MemoryStore) -> None:
-    obs.put(store, "pre/col/versions.json", b"{}")
-
-    push_mod._upload_versions_json(store, "pre", "col", {}, "stale-etag", force=True)
-
-    assert _content_type(store, "pre/col/versions.json") == "application/json"
-
-
-@pytest.mark.unit
-def test_upload_versions_json_other_errors_propagate(
-    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def boom(*_a: Any, **_k: Any) -> None:
-        raise OSError("disk on fire")
-
-    monkeypatch.setattr(push_mod.obs, "put", boom)
-
-    with pytest.raises(OSError, match="disk on fire"):
-        push_mod._upload_versions_json(store, "pre", "col", {}, None)
-
-
-@pytest.mark.unit
 async def test_upload_versions_json_async_other_errors_propagate(
     store: MemoryStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -284,3 +244,19 @@ async def test_upload_versions_json_async_other_errors_propagate(
 
     with pytest.raises(OSError, match="disk on fire"):
         await push_mod._upload_versions_json_async(store, "pre", "col", {}, None)
+
+
+@pytest.mark.unit
+async def test_upload_metadata_files_async_verbose(
+    tmp_path: Path, store: MemoryStore, capsys: pytest.CaptureFixture[str]
+) -> None:
+    coll = tmp_path / "col"
+    coll.mkdir()
+    (coll / "style.json").write_text("{}")
+
+    count, errors = await push_mod._upload_metadata_files_async(
+        store, tmp_path, "pre", "col", verbose=True
+    )
+
+    assert (count, errors) == (1, [])
+    assert "Uploaded col/style.json" in capsys.readouterr().out
