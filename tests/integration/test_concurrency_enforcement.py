@@ -255,7 +255,7 @@ class TestChunkConcurrencyEnforcement:
         def mock_put(store: Any, key: str, data: Any, **kwargs: Any) -> None:
             put_calls.append({"key": key, "max_concurrency": kwargs.get("max_concurrency")})
 
-        async def mock_put_async(store: Any, key: str, data: bytes) -> None:
+        async def mock_put_async(store: Any, key: str, data: bytes, **kwargs: Any) -> None:
             put_async_calls.append({"key": key, "size": len(data)})
 
         with (
@@ -295,7 +295,7 @@ class TestChunkConcurrencyEnforcement:
         def mock_put(store: Any, key: str, data: Any, **kwargs: Any) -> None:
             put_calls.append({"key": key})
 
-        async def mock_put_async(store: Any, key: str, data: bytes) -> None:
+        async def mock_put_async(store: Any, key: str, data: bytes, **kwargs: Any) -> None:
             put_async_calls.append({"key": key, "size": len(data)})
 
         with (

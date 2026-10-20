@@ -81,6 +81,7 @@ from obstore.store import (
 
 from portolan_cli.errors import InsecureS3EndpointError, ProfileCredentialsError
 from portolan_cli.output import detail, error, info, success
+from portolan_cli.sync.content_type import put_attributes
 from portolan_cli.trace import submit
 
 if TYPE_CHECKING:
@@ -961,7 +962,13 @@ def _upload_one_file(
         if verbose:
             info(f"Uploading {file_path.name} ({size_mb:.2f} MB) -> {target_key}")
 
-        obs.put(store, target_key, file_path, max_concurrency=kwargs.get("max_concurrency", 4))
+        obs.put(
+            store,
+            target_key,
+            file_path,
+            max_concurrency=kwargs.get("max_concurrency", 4),
+            attributes=put_attributes(target_key),
+        )
 
         elapsed = time.time() - start_time
         speed_mbps = size_mb / elapsed if elapsed > 0 else 0
@@ -1039,7 +1046,13 @@ def upload_file(
         start_time = time.time()
         info(f"Uploading {source.name} ({size_mb:.2f} MB) -> {target_key}")
 
-        obs.put(store, target_key, source, max_concurrency=kwargs.get("max_concurrency", 4))
+        obs.put(
+            store,
+            target_key,
+            source,
+            max_concurrency=kwargs.get("max_concurrency", 4),
+            attributes=put_attributes(target_key),
+        )
 
         elapsed = time.time() - start_time
         speed_mbps = size_mb / elapsed if elapsed > 0 else 0

@@ -431,7 +431,7 @@ class TestPushMetadataSync:
 
         uploaded_keys: list[str] = []
 
-        async def mock_put_async(store, key, content):
+        async def mock_put_async(store, key, content, **kwargs):
             uploaded_keys.append(key)
 
         with patch("portolan_cli.sync.push.obs.put_async", side_effect=mock_put_async):
@@ -695,7 +695,7 @@ class TestUploadOrdering:
 
         uploaded_keys: list[str] = []
 
-        async def mock_put_async(store, key, content):
+        async def mock_put_async(store, key, content, **kwargs):
             uploaded_keys.append(key)
 
         with patch("portolan_cli.sync.push.obs.put_async", side_effect=mock_put_async):

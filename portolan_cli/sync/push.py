@@ -39,6 +39,7 @@ from portolan_cli.constants import LEGACY_GLOB_FIELD
 from portolan_cli.derived_assets import is_optional_derivative
 from portolan_cli.logo import LOGO_ASSETS_DIRNAME
 from portolan_cli.output import detail, error, info, output_section, success, warn
+from portolan_cli.sync.content_type import put_attributes
 from portolan_cli.sync.upload import ObjectStore, setup_store
 from portolan_cli.sync.upload_progress import UploadProgressReporter
 from portolan_cli.trace import count, span, submit
@@ -1209,7 +1210,7 @@ def _upload_stac_files(
                             content, prefix, collection_path
                         )
 
-                    obs.put(store, target_key, content)
+                    obs.put(store, target_key, content, attributes=put_attributes(target_key))
                     files_uploaded += 1
                     uploaded_keys.append(target_key)
                     reporter.advance(bytes_uploaded=file_size)
@@ -1265,7 +1266,7 @@ def _upload_readmes(
             else:
                 detail(f"Uploading README: {rel_path}")
                 content = readme_path.read_bytes()
-                obs.put(store, target_key, content)
+                obs.put(store, target_key, content, attributes=put_attributes(target_key))
                 files_uploaded += 1
 
         except Exception as e:
@@ -1274,6 +1275,24 @@ def _upload_readmes(
             error(error_msg)
 
     return files_uploaded, errors
+
+
+def _reraise_if_conflict(e: Exception) -> None:
+    """Raise PushConflictError when e is an etag precondition failure."""
+    if "Precondition" in str(e) or "PreconditionError" in str(type(e).__name__):
+        raise PushConflictError("Remote changed during push, re-run push to try again") from e
+
+
+def _versions_put_options(key: str, etag: str | None, force: bool) -> dict[str, Any]:
+    """Build obstore put options for versions.json.
+
+    Force mode or a first push overwrites. Otherwise the put is conditional on
+    the etag (optimistic locking); obstore takes an UpdateVersion dict as mode.
+    """
+    options: dict[str, Any] = {"attributes": put_attributes(key)}
+    if not force and etag is not None:
+        options["mode"] = {"e_tag": etag}
+    return options
 
 
 def _upload_versions_json(
@@ -1303,16 +1322,9 @@ def _upload_versions_json(
     content = json.dumps(versions_data, indent=2).encode("utf-8")
 
     try:
-        if force or etag is None:
-            # Force mode or first push: use overwrite
-            obs.put(store, key, content)
-        else:
-            # Conditional put with etag (optimistic locking)
-            # obstore uses UpdateVersion dict as the mode parameter
-            obs.put(store, key, content, mode={"e_tag": etag})
+        obs.put(store, key, content, **_versions_put_options(key, etag, force))
     except Exception as e:
-        if "Precondition" in str(e) or "PreconditionError" in str(type(e).__name__):
-            raise PushConflictError("Remote changed during push, re-run push to try again") from e
+        _reraise_if_conflict(e)
         raise
 
 
@@ -1557,7 +1569,13 @@ async def _upload_assets_async(
         size_bytes = file_sizes[file_path]
         start = time.perf_counter()
         with span("push.upload_file", key=target_key, bytes=size_bytes, multipart=True):
-            obs.put(store, target_key, file_path, max_concurrency=max_conc)
+            obs.put(
+                store,
+                target_key,
+                file_path,
+                max_concurrency=max_conc,
+                attributes=put_attributes(target_key),
+            )
         duration = time.perf_counter() - start
         return target_key, size_bytes, duration
 
@@ -1586,7 +1604,7 @@ async def _upload_assets_async(
         start = time.perf_counter()
         with span("push.upload_file", key=target_key, bytes=size_bytes, multipart=False):
             content = asset_path.read_bytes()
-            await obs.put_async(store, target_key, content)
+            await obs.put_async(store, target_key, content, attributes=put_attributes(target_key))
         duration = time.perf_counter() - start
         return target_key, size_bytes, duration
 
@@ -1726,7 +1744,9 @@ async def _upload_stac_files_async(
                     collection_path = rel_path.parent.as_posix()
                     content = _transform_collection_glob_assets(content, prefix, collection_path)
 
-                await obs.put_async(store, target_key, content)
+                await obs.put_async(
+                    store, target_key, content, attributes=put_attributes(target_key)
+                )
                 return target_key, file_size
             except Exception as e:
                 error_msg = f"Failed to upload {file_path}: {e}"
@@ -1804,13 +1824,9 @@ async def _upload_versions_json_async(
     content = json.dumps(versions_data, separators=(",", ":")).encode("utf-8")
 
     try:
-        if force or etag is None:
-            await obs.put_async(store, key, content)
-        else:
-            await obs.put_async(store, key, content, mode={"e_tag": etag})
+        await obs.put_async(store, key, content, **_versions_put_options(key, etag, force))
     except Exception as e:
-        if "Precondition" in str(e) or "PreconditionError" in str(type(e).__name__):
-            raise PushConflictError("Remote changed during push, re-run push to try again") from e
+        _reraise_if_conflict(e)
         raise
 
 
@@ -1855,7 +1871,9 @@ async def _upload_readmes_async(
 
                 detail(f"Uploading README: {rel_path}")
                 content = readme_path.read_bytes()
-                await obs.put_async(store, target_key, content)
+                await obs.put_async(
+                    store, target_key, content, attributes=put_attributes(target_key)
+                )
                 return True
             except Exception as e:
                 error_msg = f"Failed to upload {readme_path}: {e}"
@@ -1926,7 +1944,9 @@ async def _upload_metadata_files_async(
                 # Use as_posix() for consistent path separators in object keys
                 target_key = f"{prefix}/{rel_path.as_posix()}".lstrip("/")
                 content = file_path.read_bytes()
-                await obs.put_async(store, target_key, content)
+                await obs.put_async(
+                    store, target_key, content, attributes=put_attributes(target_key)
+                )
                 if verbose:
                     detail(f" Uploaded {rel_path} ({len(content)} bytes)")
                 return True
@@ -2490,6 +2510,11 @@ def _push_all_process_result(
             stats["errors"][coll] = ["Unknown error"]
 
 
+def _put_bytes(store: ObjectStore, key: str, content: bytes) -> None:
+    """Upload bytes with a Content-Type derived from the key."""
+    obs.put(store, key, content, attributes=put_attributes(key))
+
+
 def _discover_root_metadata_files(catalog_root: Path) -> list[Path]:
     """Discover root-level metadata files that should be synced (Issue #426).
 
@@ -2643,7 +2668,7 @@ def _upload_root_files(
     """
     root_readme = catalog_root / "README.md"
     if root_readme.exists():
-        obs.put(store, f"{prefix}/README.md".lstrip("/"), root_readme.read_bytes())
+        _put_bytes(store, f"{prefix}/README.md".lstrip("/"), root_readme.read_bytes())
         success("Uploaded README.md")
         stats["total_files"] += 1
 
@@ -2652,20 +2677,20 @@ def _upload_root_files(
     # top-level file is unaffected, because its relative path is its name.
     for meta_file in root_metadata:
         meta_rel = meta_file.relative_to(catalog_root).as_posix()
-        obs.put(store, f"{prefix}/{meta_rel}".lstrip("/"), meta_file.read_bytes())
+        _put_bytes(store, f"{prefix}/{meta_rel}".lstrip("/"), meta_file.read_bytes())
         detail(f" Synced {meta_rel}")
         stats["total_files"] += 1
     if root_metadata:
         info(f"Synced {len(root_metadata)} root metadata file(s)")
 
     catalog_json = catalog_root / "catalog.json"
-    obs.put(store, f"{prefix}/catalog.json".lstrip("/"), catalog_json.read_bytes())
+    _put_bytes(store, f"{prefix}/catalog.json".lstrip("/"), catalog_json.read_bytes())
     success("Uploaded catalog.json")
     stats["total_files"] += 1
 
     for inter_file in intermediate_files:
         inter_rel = inter_file.relative_to(catalog_root).as_posix()
-        obs.put(store, f"{prefix}/{inter_rel}".lstrip("/"), inter_file.read_bytes())
+        _put_bytes(store, f"{prefix}/{inter_rel}".lstrip("/"), inter_file.read_bytes())
         detail(f" Uploaded {inter_rel}")
         stats["total_files"] += 1
     if intermediate_files:
@@ -2673,7 +2698,7 @@ def _upload_root_files(
 
     root_versions = catalog_root / "versions.json"
     if root_versions.exists():
-        obs.put(store, f"{prefix}/versions.json".lstrip("/"), root_versions.read_bytes())
+        _put_bytes(store, f"{prefix}/versions.json".lstrip("/"), root_versions.read_bytes())
         success("Uploaded versions.json")
         stats["total_files"] += 1
 
